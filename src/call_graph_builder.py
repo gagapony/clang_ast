@@ -41,7 +41,8 @@ class CallGraphBuilder:
         scope_root: str,
         max_depth: int = 100,
         max_nodes: int = 10000,
-        verbose: bool = False
+        verbose: bool = False,
+        callback_config: str = None
     ):
         """
         Initialize call graph builder.
@@ -53,6 +54,7 @@ class CallGraphBuilder:
             max_depth: Maximum recursion depth
             max_nodes: Maximum nodes to process
             verbose: Enable verbose logging
+            callback_config: Callback API configuration file path
         """
         self.client = clangd_client
         self.filter_config = filter_config
@@ -60,6 +62,7 @@ class CallGraphBuilder:
         self.max_depth = max_depth
         self.max_nodes = max_nodes
         self.verbose = verbose
+        self.callback_config = callback_config
 
         # Graph storage
         self.nodes: List[CallGraphNode] = []
@@ -83,6 +86,64 @@ class CallGraphBuilder:
     def _make_node_id(self, file_path: str, line: int) -> str:
         """Create unique node ID from file path and line number."""
         return f"{file_path}:{line}"
+
+    def _search_for_definition_in_file(self, file_path: str, function_name: str) -> Optional[int]:
+        """
+        Search for function definition within a file.
+
+        Args:
+            file_path: Path to source file
+            function_name: Function name to search for (bare or qualified like "ClassName::funcName")
+
+        Returns:
+            Line number of definition (0-based), or None if not found
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                lines = content.splitlines(True)
+
+            # Build search patterns based on whether function_name is qualified
+            patterns = []
+
+            if '::' in function_name:
+                # Qualified name like "PWMDriver::setPTCPWM"
+                escaped = re.escape(function_name)
+                # Single-line: ... PWMDriver::setPTCPWM(...) {
+                patterns.append(rf'\b{escaped}\s*\([^)]*\)\s*\{{')
+                # Multi-line: ... PWMDriver::setPTCPWM(...)\n{
+                patterns.append(rf'\b{escaped}\s*\([^)]*\)\s*\n\s*\{{')
+                # Definition with return type on same line
+                patterns.append(rf'\b{escaped}\s*\(')
+            else:
+                # Bare name like "computePTCPWM"
+                escaped = re.escape(function_name)
+                # Bare function definition: funcName(...) {
+                patterns.append(rf'\b{escaped}\s*\([^)]*\)\s*\{{')
+                # Member function definition: ClassName::funcName(...) {
+                patterns.append(rf'\b\w+::{escaped}\s*\([^)]*\)\s*\{{')
+                # Multi-line variants: opening brace on next line
+                patterns.append(rf'\b{escaped}\s*\([^)]*\)\s*\n\s*\{{')
+                patterns.append(rf'\b\w+::{escaped}\s*\([^)]*\)\s*\n\s*\{{')
+
+            # Try each pattern against full content (handles multi-line)
+            for pattern in patterns:
+                m = re.search(pattern, content, re.MULTILINE)
+                if m:
+                    # Find which line this match is on
+                    line_num = content[:m.start()].count('\n')
+                    return line_num
+
+            # Fallback: search line by line for partial matches
+            for i, line in enumerate(lines):
+                clean_line = re.sub(r'//.*|/\*.*\*/', '', line)
+                for pattern in patterns:
+                    if re.search(pattern, clean_line):
+                        return i
+
+            return None
+        except Exception:
+            return None
 
     def _ensure_file_opened(self, file_path: str) -> None:
         """Ensure file is opened in Clangd."""
@@ -196,17 +257,121 @@ class CallGraphBuilder:
                 if match:
                     qualified_name = match.group(1)
 
-                # Look for comment on previous line
-                if idx - 1 >= 0:
-                    prev_line = lines[idx - 1].strip()
-                    if prev_line.startswith('//'):
-                        brief = prev_line.lstrip('/').strip()
-                    elif prev_line.endswith('*/'):
-                        brief = prev_line.replace('/*', '').replace('*/', '').strip()
+                # Look for brief comment above function definition
+                brief = self._extract_brief_comment(lines, idx)
         except Exception:
             pass
 
         return qualified_name, brief
+
+    def _extract_brief_comment(self, lines: List[str], def_line_idx: int) -> str:
+        """
+        Extract brief comment above a function definition.
+
+        Supports:
+        - Single-line: // brief text
+        - Doxygen: /** @brief text */ (single line)
+        - Doxygen multi-line:
+          /**
+           * @brief text
+           */
+        - Block comment:
+          /*
+           * text
+           */
+
+        Args:
+            lines: File lines
+            def_line_idx: Index of function definition line (0-based)
+
+        Returns:
+            Brief comment text (stripped of markers), or empty string
+        """
+        # First: check if the line immediately above is a closing block comment
+        # e.g. " */" or "/** @brief ... */"
+        search_limit = max(0, def_line_idx - 12)
+
+        comment_lines = []
+        in_block_comment = False
+
+        for i in range(def_line_idx - 1, search_limit - 1, -1):
+            line = lines[i].strip()
+
+            # Empty line: allow within block comments, stop otherwise
+            if not line:
+                if in_block_comment:
+                    continue
+                break
+
+            # Check for code-like content that shouldn't be in a comment
+            # (preprocessor directives, braces, semicolons as statement ends)
+            if not in_block_comment and not line.startswith('//'):
+                # If not starting a comment, this might be code
+                if line.startswith('#') or line == '{' or line == '}':
+                    break
+
+            if line.endswith('*/'):
+                in_block_comment = True
+                content = re.sub(r'\*/$', '', line).strip()
+                content = re.sub(r'^/\*{0,2}\s*', '', content).strip()
+                content = content.lstrip('*').strip()
+                # Skip code-like, preprocessor, or trivial comments
+                if content and not re.search(r'[{}#;]', content) and len(content) > 3:
+                    comment_lines.insert(0, content)
+                continue
+
+            if in_block_comment:
+                if line.startswith('/*') or line.startswith('/**'):
+                    content = re.sub(r'^/\*{0,2}\s*', '', line).strip()
+                    content = content.lstrip('*').strip()
+                    if content and not re.search(r'[{}#;]', content) and len(content) > 3:
+                        comment_lines.insert(0, content)
+                    break
+                # Middle line of block comment - strip leading *
+                content = re.sub(r'^\s*\*+\s?', '', line).strip()
+                # Skip lines that look like code (contain {, }, #, ;)
+                if content and not re.search(r'[{}#;]', content) and len(content) > 3:
+                    comment_lines.insert(0, content)
+                continue
+
+            if line.startswith('//'):
+                content = line.lstrip('/').strip()
+                comment_lines.insert(0, content)
+                break
+
+            # Non-comment line: stop
+            break
+
+        if not comment_lines:
+            return ""
+
+        # Join all comment lines
+        full_comment = ' '.join(comment_lines)
+
+        # Extract @brief if present (Doxygen style)
+        brief_match = re.search(r'@brief\s+(.+?)(?:\s+@\w+|$)', full_comment)
+        if brief_match:
+            brief = brief_match.group(1).strip()
+        else:
+            brief = full_comment.strip()
+
+        # Sanitize: remove URLs, code fragments, overly long content
+        brief = re.sub(r'https?://\S+', '', brief).strip()
+        brief = re.sub(r'\bSource:\s*', '', brief).strip()
+        brief = re.sub(r'\s+', ' ', brief)
+
+        # Skip if comment is just a filename reference (e.g., "u8g2_buffer.c")
+        if re.match(r'^[\w./\\-]+\.(c|cpp|cc|cxx|h|hpp|hxx)$', brief, re.IGNORECASE):
+            return ""
+
+        # Truncate to reasonable length (first sentence or 120 chars)
+        sentence_end = re.search(r'[.!?。]\s', brief)
+        if sentence_end and sentence_end.end() < 120:
+            brief = brief[:sentence_end.end()].strip()
+        elif len(brief) > 120:
+            brief = brief[:117].strip() + '...'
+
+        return brief
 
     def _pick_best_definition(self, defs) -> Optional[Dict]:
         """Pick best definition from multiple results."""
@@ -304,8 +469,18 @@ class CallGraphBuilder:
         file_path: str,
         start_line_0: int,
         end_line_0: int
-    ) -> List[Tuple[str, int, int]]:
-        """Find function calls within a function body."""
+    ) -> List[Tuple[str, int, int, bool]]:
+        """
+        Find function calls within a function body.
+
+        Returns list of (function_name, line, character, is_callback_api) tuples.
+        is_callback_api indicates if this is a callback API call.
+
+        Catches:
+        - Direct calls: func(...)
+        - Member calls: obj.method(...) -> reports method name
+        - Qualified calls: Class::method(...) -> reports full qualified name
+        """
         calls = []
         keywords = {'if', 'while', 'for', 'switch', 'sizeof', 'return',
                     'catch', '__attribute__', 'new', 'delete'}
@@ -316,12 +491,56 @@ class CallGraphBuilder:
 
             for i in range(max(0, start_line_0), min(end_line_0, len(lines))):
                 line = re.sub(r'//.*', '', lines[i])
+
+                # Pass 1: Find qualified calls Class::method(...)
+                # Must check BEFORE bare name pass to avoid duplicating method names
+                for match in re.finditer(r'\b([a-zA-Z_]\w*::[a-zA-Z_]\w*)\s*\(', line):
+                    func_name = match.group(1)
+                    base_name = func_name.split('::')[-1]
+                    if base_name not in keywords:
+                        from .callback_config import is_callback_api
+                        is_callback, _ = is_callback_api(func_name, self.callback_config)
+                        calls.append((func_name, i, match.start(1), is_callback))
+
+                # Pass 2: Find direct function calls: func() and member calls obj.method()
+                # Track positions already covered by qualified calls
+                covered_ranges = set()
+                for match in re.finditer(r'\b([a-zA-Z_]\w*::[a-zA-Z_]\w*)\s*\(', line):
+                    for pos in range(match.start(), match.end()):
+                        covered_ranges.add(pos)
+
                 for match in re.finditer(r'\b([a-zA-Z_]\w*)\s*\(', line):
                     func_name = match.group(1)
-                    if func_name not in keywords:
-                        calls.append((func_name, i, match.start(1)))
-        except Exception:
-            pass
+                    if func_name not in keywords and match.start() not in covered_ranges:
+                        # Check if this is a callback API call (use config)
+                        from .callback_config import is_callback_api
+                        is_callback, _ = is_callback_api(func_name, self.callback_config)
+
+                        # Mark callback APIs, but don't skip them
+                        # (they're processed specially in _build_outgoing)
+                        calls.append((func_name, i, match.start(1), is_callback))
+
+                # Pass 3: Find member calls obj.method(...), extract method name
+                # Pattern: identifier.methodName( where identifier is NOT a keyword
+                for match in re.finditer(r'(?<!::)\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\s*\(', line):
+                    obj_name = match.group(1)
+                    method_name = match.group(2)
+                    if method_name not in keywords and obj_name not in keywords:
+                        from .callback_config import is_callback_api
+                        is_callback, _ = is_callback_api(method_name, self.callback_config)
+                        calls.append((method_name, i, match.start(2), is_callback))
+
+                # Pass 4: Find pointer member calls obj->method(...)
+                for match in re.finditer(r'\b([a-zA-Z_]\w*)->([a-zA-Z_]\w*)\s*\(', line):
+                    obj_name = match.group(1)
+                    method_name = match.group(2)
+                    if method_name not in keywords and obj_name not in keywords:
+                        from .callback_config import is_callback_api
+                        is_callback, _ = is_callback_api(method_name, self.callback_config)
+                        calls.append((method_name, i, match.start(2), is_callback))
+
+        except Exception as e:
+            self._log(f"Error finding calls: {e}")
 
         return calls
 
@@ -344,10 +563,59 @@ class CallGraphBuilder:
         caller_path = self.client._uri_to_path(caller_uri)
         start_0, end_0 = self._get_function_range(caller_path, caller_start_line)
 
+        self._log(f"  Analyzing {caller_name} @ lines {start_0}-{end_0}")
+
         # Find calls in function body
         calls = self._find_calls_in_function(caller_path, start_0, end_0)
 
-        for callee_name, line_idx, char_idx in calls:
+        self._log(f"  Found {len(calls)} calls in {caller_name}")
+
+        for callee_name, line_idx, char_idx, is_callback_api in calls:
+            # Special handling for callback APIs
+            if is_callback_api:
+                # Try to resolve callback function (indirect call)
+                # Skip the callback API itself, only add the callback function
+                callback_results = self._resolve_callback_parameter(
+                    caller_path, line_idx, callee_name
+                )
+
+                if callback_results:
+                    for cb_name, cb_line, cb_char in callback_results:
+                        # Resolve callback function definition
+                        try:
+                            result = self.client.textDocument_definition(
+                                caller_uri,
+                                line=cb_line,
+                                character=cb_char
+                            )
+                        except Exception as e:
+                            self._log(f"Error resolving callback {cb_name}: {e}")
+                            continue
+
+                        if result:
+                            target_uri = result.get("uri") or result.get("targetUri")
+                            if target_uri:
+                                range_info = result.get("range") or result.get("targetRange", {})
+                                start_line_0 = range_info.get("start", {}).get("line", 0)
+
+                                cb_path = self.client._uri_to_path(target_uri)
+
+                                if self._should_include(cb_path):
+                                    cb_id = self._register_node(cb_path, start_line_0 + 1, cb_name)
+
+                                    edge_key = (caller_id, cb_id)
+                                    if edge_key not in self.processed_outgoing:
+                                        self.processed_outgoing.add(edge_key)
+                                        self._add_edge(caller_id, cb_id)
+
+                                        if self._is_in_scope(cb_path):
+                                            self._ensure_file_opened(cb_path)
+                                            self._build_outgoing(target_uri, cb_name, start_line_0, cb_id, current_depth + 1)
+                                        else:
+                                            self._log(f"  Not recursing into external callback: {cb_name} @ {cb_path}")
+
+                continue  # Skip normal processing for callback APIs
+
             # Resolve call target using definition
             try:
                 result = self.client.textDocument_definition(
@@ -374,7 +642,66 @@ class CallGraphBuilder:
 
             # Check if should include this file
             if not self._should_include(callee_path):
+                # Still register the node and edge, but don't recurse
+                self._log(f"  Skipping out-of-scope: {callee_name} @ {callee_path}")
                 continue
+
+            self._log(f"  Resolving: {callee_name} @ {callee_path}")
+
+            # Check if callee is within caller's function body
+            # This handles cases where Clangd returns declaration instead of definition
+            in_body = (start_0 <= start_line_0 <= end_0)
+            self._log(f"  Definition check: caller_lines={start_0}-{end_0}, callee_line={start_line_0}, in_body={in_body}")
+
+            if not in_body:
+                # Callee definition is outside caller's function body
+                # Likely a forward declaration or member function declared in header
+                # Try to search for actual definition in the same file
+                self._log(f"  Warning: Definition at line {start_line_0} is outside caller body (caller lines: {start_0}-{end_0})")
+                # Search for actual definition
+                actual_def_line = self._search_for_definition_in_file(
+                    callee_path, callee_name
+                )
+                if actual_def_line is None and '::' in callee_name:
+                    # Try base name (strip namespace/class prefix)
+                    base_name = callee_name.split('::')[-1]
+                    self._log(f"  Retrying with base name: {base_name}")
+                    actual_def_line = self._search_for_definition_in_file(
+                        callee_path, base_name
+                    )
+                # If clangd returned a header declaration, search the .cpp counterpart
+                if actual_def_line is None and callee_path.endswith(('.h', '.hpp')):
+                    cpp_candidates = []
+                    base = callee_path.rsplit('.', 1)[0]
+                    for ext in ('.cpp', '.cc', '.cxx', '.c'):
+                        cpp_candidates.append(base + ext)
+                    # Also check in the caller's directory
+                    caller_dir = os.path.dirname(caller_path)
+                    basename = os.path.basename(base)
+                    for ext in ('.cpp', '.cc', '.cxx', '.c'):
+                        cpp_candidates.append(os.path.join(caller_dir, basename + ext))
+                    for cpp_path in cpp_candidates:
+                        if os.path.isfile(cpp_path):
+                            self._log(f"  Trying .cpp counterpart: {cpp_path}")
+                            actual_def_line = self._search_for_definition_in_file(
+                                cpp_path, callee_name
+                            )
+                            if actual_def_line is None and '::' in callee_name:
+                                actual_def_line = self._search_for_definition_in_file(
+                                    cpp_path, callee_name.split('::')[-1]
+                                )
+                            if actual_def_line is not None:
+                                callee_path = cpp_path
+                                target_uri = self.client._path_to_uri(cpp_path)
+                                break
+                if actual_def_line is not None:
+                    # Found actual definition, use it
+                    start_line_0 = actual_def_line
+                    self._log(f"  Using actual definition at line {actual_def_line}")
+                else:
+                    # Couldn't find better definition, skip this call
+                    self._log(f"  Skipping: couldn't find definition for {callee_name} in function body")
+                    continue
 
             # Register callee node
             callee_id = self._register_node(callee_path, start_line_0 + 1, callee_name)
@@ -386,10 +713,110 @@ class CallGraphBuilder:
             self.processed_outgoing.add(edge_key)
             self._add_edge(caller_id, callee_id)
 
-            # Recurse if in scope
+            # Only recurse if in scope
             if self._is_in_scope(callee_path):
                 self._ensure_file_opened(callee_path)
                 self._build_outgoing(target_uri, callee_name, start_line_0, callee_id, current_depth + 1)
+            else:
+                self._log(f"  Not recursing into external: {callee_name} @ {callee_path}")
+
+    def _resolve_callback_parameter(
+        self,
+        file_path: str,
+        line_0: int,
+        api_name: str
+    ) -> List[Tuple[str, int, int]]:
+        """
+        Resolve callback function parameters in callback API calls.
+
+        Args:
+            file_path: File containing the API call
+            line_0: Line number (0-based)
+            api_name: Name of the callback API
+
+        Returns:
+            List of (callback_name, line, char) tuples
+        """
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                lines = f.readlines()
+
+            if line_0 >= len(lines):
+                return []
+
+            # Get callback parameter position for this API (from config)
+            from .callback_config import is_callback_api
+            is_callback, param_idx = is_callback_api(api_name, self.callback_config)
+
+            if not is_callback:
+                return []
+
+            self._log(f"  Resolving callback parameter {param_idx} for API '{api_name}'")
+
+            # For multi-line calls, accumulate lines until closing parenthesis
+            lines_accum = []
+            paren_count = 0
+            start_line = line_0
+
+            for i in range(start_line, len(lines)):
+                line = lines[i]
+                lines_accum.append(line)
+
+                paren_count += line.count('(')
+                paren_count -= line.count(')')
+
+                if paren_count <= 0:
+                    break
+
+            full_text = ''.join(lines_accum)
+
+            # Extract parameters (simplified parsing)
+            open_paren = full_text.find('(')
+            if open_paren == -1:
+                return []
+
+            params_str = full_text[open_paren + 1:]
+
+            # Find matching closing parenthesis
+            paren_count = 1
+            close_paren = -1
+            for i, c in enumerate(params_str):
+                if c == '(':
+                    paren_count += 1
+                elif c == ')':
+                    paren_count -= 1
+                    if paren_count == 0:
+                        close_paren = i
+                        break
+
+            if close_paren == -1:
+                return []
+
+            params_str = params_str[:close_paren]
+
+            # Split by comma and extract the callback parameter
+            params = [p.strip() for p in params_str.split(',')]
+
+            if param_idx >= len(params):
+                return []
+
+            callback_param = params[param_idx]
+
+            # Extract callback name (function identifier)
+            callback_match = re.search(r'\b([a-zA-Z_]\w*)\b', callback_param)
+            if not callback_match:
+                return []
+
+            callback_name = callback_match.group(1)
+
+            # Find character position in original line
+            callback_char = lines[start_line].find(callback_name)
+
+            return [(callback_name, line_0, callback_char)]
+
+        except Exception as e:
+            self._log(f"Error resolving callback: {e}")
+            return []
 
     def _build_incoming(
         self,
@@ -437,6 +864,8 @@ class CallGraphBuilder:
 
             # Check if should include this file
             if not self._should_include(caller_path):
+                # Still register to show caller, but don't recurse
+                self._log(f"  Skipping out-of-scope caller: {caller_path}")
                 continue
 
             # Register caller node
@@ -449,7 +878,7 @@ class CallGraphBuilder:
             self.processed_incoming.add(edge_key)
             self._add_edge(caller_id, target_id)
 
-            # Recurse if in scope
+            # Only recurse if in scope
             if self._is_in_scope(caller_path):
                 # Find character position of caller name
                 char_idx = 0
@@ -467,6 +896,8 @@ class CallGraphBuilder:
                 self._build_incoming(
                     caller_uri, caller_name, caller_sig_line, char_idx, caller_id, current_depth + 1
                 )
+            else:
+                self._log(f"  Not recursing into external caller: {caller_name} @ {caller_path}")
 
     def build(
         self,
@@ -781,13 +1212,14 @@ class CallGraphBuilder:
         for node in self.nodes:
             graph_data.append({
                 "index": node.id,
+                "tag": "EXTERNAL" if node.is_external else "INTERNAL",
                 "self": {
                     "path": node.file_path,
                     "line": [node.start_line, node.end_line],
                     "type": "function",
                     "name": node.function_name,
                     "qualified_name": node.qualified_name,
-                    "brief": node.brief
+                    "brief": node.brief if node.brief else None
                 },
                 "parents": node.parents,
                 "children": node.children
@@ -795,23 +1227,87 @@ class CallGraphBuilder:
 
         return json.dumps(graph_data, indent=2, ensure_ascii=False)
 
-    def to_tree_text(self, root_id: int, indent: int = 4) -> str:
-        """Export graph as indented tree text (downstream only)."""
+    def _format_node_text(self, node: CallGraphNode) -> str:
+        """
+        Format a single node for text output.
+
+        Format: funcName [file:filename:line, brief:xxx, tag: INTERNAL/EXTERNAL]
+
+        Args:
+            node: CallGraphNode to format
+
+        Returns:
+            Formatted string
+        """
+        filename = os.path.basename(node.file_path)
+        parts = [f"file:{filename}:{node.start_line}"]
+
+        if node.brief:
+            parts.append(f"brief: {node.brief}")
+        else:
+            parts.append("brief: null")
+
+        tag = "EXTERNAL" if node.is_external else "INTERNAL"
+        parts.append(f"tag: {tag}")
+
+        return f"{node.function_name} [{', '.join(parts)}]"
+
+    def to_tree_text(self, root_id: int, indent: int = 4, show_callers: bool = True, max_display_depth: int = 3) -> str:
+        """
+        Export graph as indented tree text.
+
+        Shows both callers (who calls this function) and callees (who this function calls).
+
+        Args:
+            root_id: Root node ID
+            indent: Indentation size (default: 4)
+            show_callers: Whether to show caller section (default: True)
+            max_display_depth: Maximum depth to display in tree (default: 3)
+        """
         lines = []
+        root_node = self.nodes[root_id]
 
-        def print_node(node_id: int, depth: int):
-            node = self.nodes[node_id]
-            prefix = " " * (depth * indent)
-            loc = f"{os.path.basename(node.file_path)}:{node.start_line}"
-            marker = " [EXTERNAL]" if node.is_external else ""
+        # Print root function
+        lines.append(self._format_node_text(root_node))
 
-            lines.append(f"{prefix}{node.function_name} ({loc}){marker}")
+        # Print callers (if any and enabled)
+        if show_callers and root_node.parents:
+            lines.append("")
+            lines.append("  [Called by]")
+            for parent_id in root_node.parents:
+                parent = self.nodes[parent_id]
+                lines.append(f"    {self._format_node_text(parent)}")
 
-            # Print children
-            for child_id in node.children:
-                print_node(child_id, depth + 1)
+        # Print callees (if any)
+        if root_node.children:
+            if show_callers and root_node.parents:
+                lines.append("")
 
-        print_node(root_id, 0)
+            lines.append("  [Calls]")
+
+            def print_children(node_id: int, depth: int, visited: set):
+                # Prevent cycles with visited set
+                if node_id in visited:
+                    return
+
+                if depth >= max_display_depth:
+                    return
+
+                visited.add(node_id)
+
+                node = self.nodes[node_id]
+                prefix = " " * (2 + depth * indent)
+
+                lines.append(f"{prefix}{self._format_node_text(node)}")
+
+                # Print children recursively
+                for child_id in node.children:
+                    print_children(child_id, depth + 1, visited.copy())
+
+            # Print children from root
+            for child_id in root_node.children:
+                print_children(child_id, 1, set())
+
         return "\n".join(lines)
 
     def get_stats(self) -> Dict[str, Any]:

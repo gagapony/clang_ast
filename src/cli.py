@@ -101,6 +101,13 @@ Examples:
     )
 
     parser.add_argument(
+        '--callback-config',
+        type=str,
+        default=None,
+        help='Callback API configuration file (default: callback.cfg in tool directory)'
+    )
+
+    parser.add_argument(
         '-d', '--max-depth',
         type=int,
         default=10,
@@ -277,7 +284,8 @@ def main() -> int:
             scope_root=scope_root,
             max_depth=args.max_depth,
             max_nodes=args.max_nodes,
-            verbose=args.verbose
+            verbose=args.verbose,
+            callback_config=args.callback_config
         )
 
         # Resolve entry point
@@ -298,7 +306,7 @@ def main() -> int:
         if args.format == 'json':
             output = builder.to_json()
         else:
-            output = builder.to_tree_text(root_id)
+            output = builder.to_tree_text(root_id, max_display_depth=args.max_depth)
 
         # Print stats
         stats = builder.get_stats()

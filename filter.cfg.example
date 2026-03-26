@@ -1,61 +1,34 @@
 # Filter Configuration for clangd-call-tree
-#
+
 # This file defines which paths are included or excluded from call tree analysis.
 #
 # Format:
-#   +pattern  - Include paths matching this pattern
-#   -pattern  - Exclude paths matching this pattern
+# +pattern - Include paths matching this pattern
+# -pattern - Exclude paths matching this pattern
 #
 # Rules are processed in order: first match wins.
 # If no rules match, path is included by default.
 #
 # Patterns:
-#   src/            - Match directory and all subdirectories
-#   *.cpp           - Match all .cpp files
-#   test_*.c        - Match files starting with test_
-#   /absolute/path  - Match absolute path
+# src/ - Match directory and all subdirectories
+# *.cpp - Match all .cpp files
+# test_*.c - Match files starting with test_
+# /absolute/path - Match absolute path
 #
 # Lines starting with # are comments.
 
 # Include main source directories
 +src/
-+lib/
-+include/
 
-# Exclude test directories
--test/
--tests/
--*/test/
+# Exclude test files
+-test_*
 
-# Exclude test files by name pattern
--test_*.cpp
--*_test.cpp
--*_test.c
-
-# Exclude build artifacts
+# Exclude build directories
+-.pio/
+-.vscode/
 -build/
--build/
--dist/
--out/
 
-# Exclude temporary files
--tmp/
--temp/
-
-# Exclude generated code
--gen/
--generated/
--.moc/
-
-# Exclude third-party libraries (adjust paths as needed)
+# Exclude third-party libraries
+-3rdparty/
 -vendor/
--third_party/
 -external/
-
-# Example: Only analyze specific subdirectory
-# +src/core/
-# +src/utils/
-
-# Example: Exclude specific files
-# -src/deprecated.cpp
-# -lib/old_module.c

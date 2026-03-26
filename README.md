@@ -6,10 +6,75 @@ Generate function call graphs from C/C++ projects using Clangd language server.
 
 - **Unified Entry Point**: Supports both position-based and function-name-based modes
 - **Bidirectional Traversal**: Find both callers (upstream) and callees (downstream)
+- **Callback Resolution**: Detects indirect function calls through function pointers/callbacks
+- **Configurable Callback APIs**: Define custom callback APIs via configuration file
+- **Scope Control with External Marking**: Limit analysis to scope, external files marked [EXTERNAL]
 - **Multiple Output Formats**: Text (indented tree) and JSON (adjacency list)
 - **On-Demand Loading**: No preloading - files opened as needed
-- **Scope Control**: Limit analysis to specific directories
 - **Filter Support**: Exclude/include files based on patterns
+
+### Callback Resolution (Configurable)
+
+Automatically detects and resolves callback APIs defined in configuration file:
+
+**Default supported:**
+- **FreeRTOS**: `xTaskCreate`, `pthread_create`
+- **C++ Threading**: `std::thread`, `std::async`
+- **Event Systems**: `addEventListener`, `on`
+- **Arduino**: `attachInterrupt`, `setTimeout`
+
+Example:
+```cpp
+xTaskCreate(taskControl, "Control", ...);
+```
+
+Tool automatically creates an edge: `setup` → `taskControl` and traverses into `taskControl`.
+
+**Adding custom APIs:**
+Edit `callback.cfg`:
+```
+# Format: api_name:param_index
+myCustomAPI:0
+```
+
+### Scope Control with External Marking
+
+Files outside scope are:
+- ✅ Marked as `[EXTERNAL]` in output
+- ✅ Still shown in call graph (no data loss)
+- ❌ Not recursed into (prevents infinite loops)
+
+Example with `-s src/`:
+```
+setup (main.cpp:192)
+
+  [Called by]
+    loopTask (main.cpp:40) [EXTERNAL]
+
+  [Calls]
+      begin (HardwareSerial.cpp:262) [EXTERNAL]
+      log (main.cpp:36)
+          vsnprintf (stdio.h:389) [EXTERNAL]  # Not recursed!
+      init (ControlSystem.cpp:50)
+          reset (PIDController.cpp:68)
+```
+
+### Filter Configuration
+
+Control which files to analyze using `filter.cfg`:
+
+```bash
+# Include only src/ directory
++src/
+
+# Exclude test files
+-test_*
+
+# Exclude build directories
+-.pio/
+```
+
+See `filter.cfg.example` for details.
 
 ## Installation
 
@@ -38,8 +103,14 @@ python main.py -p /path/to/project -e "setup"
 ### Common Options
 
 ```bash
-# Specify scope directory
+# Specify scope directory (external files marked [EXTERNAL])
 python main.py -p /path/to/project -e "setup" -s src/
+
+# Use custom callback configuration
+python main.py -p /path/to/project -e "setup" --callback-config my_callbacks.cfg
+
+# Use custom filter configuration
+python main.py -p /path/to/project -e "setup" -c custom_filters.cfg
 
 # Set depth limit
 python main.py -p /path/to/project -e "setup" -d 3
@@ -54,15 +125,16 @@ python main.py -p /path/to/project -e "setup" -v
 ### All Options
 
 ```
--p, --path PATH        Project directory (must contain compile_commands.json)
--e, --entry ENTRY      Entry point: "file.cpp:line:char" or "function_name"
--s, --scope SCOPE      Scope root directory (default: project root)
--c, --config CONFIG    Filter config file (default: filter.cfg)
--d, --max-depth N     Maximum recursion depth (default: 10)
--m, --max-nodes N     Maximum nodes to process (default: 10000)
--f, --format FORMAT    Output format: text|json (default: text)
--o, --output FILE     Output file (default: stdout)
--v, --verbose         Enable verbose logging
+-p, --path PATH              Project directory (must contain compile_commands.json)
+-e, --entry ENTRY            Entry point: "file.cpp:line:char" or "function_name"
+-s, --scope SCOPE            Scope root directory (default: project root)
+-c, --config CONFIG          Filter config file (default: filter.cfg)
+--callback-config CONFIG      Callback API config file (default: callback.cfg)
+-d, --max-depth N           Maximum recursion depth (default: 10)
+-m, --max-nodes N           Maximum nodes to process (default: 10000)
+-f, --format FORMAT          Output format: text|json (default: text)
+-o, --output FILE           Output file (default: stdout)
+-v, --verbose               Enable verbose logging
 ```
 
 ## Examples
@@ -94,12 +166,22 @@ python main.py -p ~/projects/myapp -e "process_data" \
 
 ### Text Format (Indented Tree)
 
+Shows both callers and callees:
+
 ```
 setup (main.cpp:192)
-    begin (HardwareSerial.cpp:262) [EXTERNAL]
-    delay (esp32-hal-misc.c:176) [EXTERNAL]
-    init (ControlSystem.cpp:50)
-        reset (PIDController.cpp:68)
+
+  [Called by]
+    loopTask (main.cpp:40) [EXTERNAL]
+
+  [Calls]
+      begin (HardwareSerial.cpp:262) [EXTERNAL]
+      delay (esp32-hal-misc.c:176) [EXTERNAL]
+      init (ControlSystem.cpp:50)
+          reset (PIDController.cpp:68)
+      taskControl (main.cpp:65)  # Callback function!
+          esp_task_wdt_add (esp_task_wdt.h:83) [EXTERNAL]
+          getState (ControlSystem.cpp:95)
 ```
 
 ### JSON Format (Adjacency List)
