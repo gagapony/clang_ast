@@ -303,27 +303,29 @@ class CallGraphBuilder:
         if not found_opening:
             return ""
 
-        # Join all lines, strip * prefixes
+        # Join all lines, strip * prefixes, preserve blank lines as separators
         parts = []
         for line in block_lines:
             content = re.sub(r'^/\*{0,2}\s*', '', line)
             content = re.sub(r'\*/$', '', content)
             content = re.sub(r'^\s*\*+\s?', '', content)
             content = content.strip()
-            if content:
-                parts.append(content)
+            # Keep empty lines as separator (don't filter out)
+            parts.append(content)
 
         if not parts:
             return ""
 
-        full_text = ' '.join(parts)
+        # Join with \n so blank lines become separators in the text
+        full_text = '\n'.join(parts)
 
-        # Extract @brief content: everything from @brief to next @tag or end
-        match = re.search(r'@brief\s+(.+?)(?:\s+@\w+|$)', full_text, re.DOTALL)
+        # Extract @brief content: stop at @tag, or blank line (paragraph break)
+        match = re.search(r'@brief\s+(.+?)(?=\s+@\w+|\n\s*\n|$)', full_text, re.DOTALL)
         if not match:
             return ""
 
         brief = match.group(1).strip()
+        # Collapse whitespace and newlines into single space
         brief = re.sub(r'\s+', ' ', brief)
 
         # Truncate: first sentence or 120 chars
