@@ -1,0 +1,13 @@
+# Core dependencies
+# No external dependencies required for JSON-RPC (implement in-house)
+
+# Optional dependencies (for enhanced features)
+# Uncomment if you want to use these features:
+
+# pydantic>=2.0.0    # For JSON schema validation
+# rich>=13.0.0       # For colored terminal output
+
+# Development dependencies (install separately)
+# pytest>=7.0.0      # For testing
+# pytest-cov>=4.0.0   # For coverage reports
+# mypy>=1.0.0        # For type checking

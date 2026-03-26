@@ -1,0 +1,138 @@
+"""
+Filter Configuration Manager
+
+Loads and parses filter.cfg configuration for scope control.
+"""
+
+import os
+from dataclasses import dataclass
+from typing import List, Optional
+import fnmatch
+
+
+@dataclass
+class FilterRule:
+    """Represents a single filter rule."""
+    action: str  # '+' or '-'
+    pattern: str  # Path pattern
+
+    def matches(self, path: str) -> bool:
+        """
+        Check if path matches this rule.
+
+        Supports:
+        - Exact paths
+        - Directory prefixes (ends with /)
+        - Wildcards (*, ?, etc.)
+        """
+        # Normalize path for matching
+        norm_path = path.replace(os.sep, '/')
+
+        # Check for directory prefix match (includes all subdirectories)
+        if self.pattern.endswith('/'):
+            # Pattern like 'src/' should match 'src/test/test.cpp'
+            return norm_path.startswith(self.pattern) or norm_path == self.pattern.rstrip('/')
+
+        # Check for exact match or wildcard match
+        return fnmatch.fnmatch(norm_path, self.pattern) or norm_path == self.pattern
+
+
+class FilterConfig:
+    """Represents filter configuration."""
+
+    def __init__(self, rules: List[FilterRule]):
+        self.rules = rules
+
+    def should_include(self, path: str) -> bool:
+        """
+        Check if path should be included based on filter rules.
+
+        Returns True if included, False if excluded.
+        First match wins (rules are processed in order).
+        If no rule matches, default to True (include all).
+        """
+        for rule in self.rules:
+            if rule.matches(path):
+                return rule.action == '+'
+
+        # Default: include if no rule matches
+        return True
+
+    @staticmethod
+    def from_file(file_path: str) -> 'FilterConfig':
+        """
+        Load filter configuration from file.
+
+        File format:
+        # Comment
+        +pattern  # Include pattern
+        -pattern  # Exclude pattern
+
+        Args:
+            file_path: Path to filter configuration file
+
+        Returns:
+            FilterConfig instance
+
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            ValueError: If file format is invalid
+        """
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Filter configuration not found: {file_path}")
+
+        rules = []
+
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line_num, line in enumerate(f, 1):
+                line = line.strip()
+
+                # Skip empty lines and comments
+                if not line or line.startswith('#'):
+                    continue
+
+                # Parse rule
+                if line[0] not in ('+', '-'):
+                    raise ValueError(
+                        f"Invalid filter rule at line {line_num}: {line}\n"
+                        f"Rules must start with '+' or '-'"
+                    )
+
+                action = line[0]
+                pattern = line[1:].strip()
+
+                if not pattern:
+                    raise ValueError(
+                        f"Empty pattern at line {line_num}: {line}\n"
+                        f"Pattern cannot be empty after action character"
+                    )
+
+                rules.append(FilterRule(action=action, pattern=pattern))
+
+        return FilterConfig(rules)
+
+    @staticmethod
+    def default() -> 'FilterConfig':
+        """
+        Create default filter configuration (include all paths).
+
+        Returns:
+            FilterConfig with no rules (includes all paths)
+        """
+        return FilterConfig(rules=[])
+
+
+def load_filter_config(config_path: Optional[str] = None) -> FilterConfig:
+    """
+    Load filter configuration from file or use default.
+
+    Args:
+        config_path: Path to filter configuration file, or None for default
+
+    Returns:
+        FilterConfig instance
+    """
+    if config_path is None:
+        return FilterConfig.default()
+
+    return FilterConfig.from_file(config_path)

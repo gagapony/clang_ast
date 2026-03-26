@@ -1,0 +1,12 @@
+[
+  {
+    "directory": "/path/to/clangd-call-tree/examples/simple_project",
+    "command": "clang++ -c src/main.cpp -Isrc -std=c++17",
+    "file": "src/main.cpp"
+  },
+  {
+    "directory": "/path/to/clangd-call-tree/examples/simple_project",
+    "command": "clang++ -c src/utils.cpp -Isrc -std=c++17",
+    "file": "src/utils.cpp"
+  }
+]
