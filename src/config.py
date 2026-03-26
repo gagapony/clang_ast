@@ -21,20 +21,24 @@ class FilterRule:
         Check if path matches this rule.
 
         Supports:
-        - Exact paths
-        - Directory prefixes (ends with /)
-        - Wildcards (*, ?, etc.)
+        - Directory prefixes: src/ or src (both match src/foo.c)
+        - Exact paths: src/main.cpp
+        - Wildcards: *.cpp, test_*.c
         """
-        # Normalize path for matching
         norm_path = path.replace(os.sep, '/')
+        norm_pattern = self.pattern.replace(os.sep, '/')
 
-        # Check for directory prefix match (includes all subdirectories)
-        if self.pattern.endswith('/'):
-            # Pattern like 'src/' should match 'src/test/test.cpp'
-            return norm_path.startswith(self.pattern) or norm_path == self.pattern.rstrip('/')
+        # Directory prefix match: pattern ends with / OR path starts with pattern/
+        if norm_pattern.endswith('/'):
+            return norm_path.startswith(norm_pattern) or norm_path == norm_pattern.rstrip('/')
 
-        # Check for exact match or wildcard match
-        return fnmatch.fnmatch(norm_path, self.pattern) or norm_path == self.pattern
+        # If no wildcards, try prefix match (treat as directory)
+        if '*' not in norm_pattern and '?' not in norm_pattern:
+            if norm_path.startswith(norm_pattern + '/') or norm_path == norm_pattern:
+                return True
+
+        # Exact or wildcard match
+        return fnmatch.fnmatch(norm_path, norm_pattern) or norm_path == norm_pattern
 
 
 class FilterConfig:

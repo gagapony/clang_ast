@@ -28,17 +28,18 @@ def parse_entry_point(entry_str: str) -> tuple:
         - For 'position': data is (file_path, line, character)
         - For 'function': data is function_name
     """
-    # Check if it's a position format (contains two colons)
-    if ':' in entry_str and entry_str.count(':') >= 2:
+    # Check if it's a position format (file:line:character)
+    if ':' in entry_str:
         try:
-            parts = entry_str.split(':')
+            # Split from right: last = character, second-to-last = line, rest = file
+            parts = entry_str.rsplit(':', 2)
             if len(parts) == 3:
                 file_path = parts[0].strip()
                 line = int(parts[1].strip())
                 character = int(parts[2].strip())
-                return 'position', (file_path, line, character)
+                if line >= 0 and character >= 0:
+                    return 'position', (file_path, line, character)
         except (ValueError, IndexError):
-            # Fallback to function mode if parsing fails
             pass
 
     # Default: function name mode
@@ -151,16 +152,23 @@ def validate_arguments(args: argparse.Namespace) -> int:
     # Validate based on mode
     if args.entry_mode == 'position':
         file_path, line, character = args.entry_data
-        if not os.path.isfile(file_path):
-            # Try relative to current directory
-            if not os.path.isfile(file_path):
-                # Try absolute path
-                abs_path = os.path.abspath(file_path)
-                if os.path.isfile(abs_path):
-                    args.entry_data = (abs_path, line, character)
-                else:
-                    print(f"Error: File not found: {file_path}", file=sys.stderr)
-                    return 1
+        project_path = os.path.abspath(args.path)
+
+        # Resolve file path: try relative to project path first, then CWD, then absolute
+        if os.path.isabs(file_path):
+            resolved = file_path
+        else:
+            resolved = os.path.join(project_path, file_path)
+
+        if not os.path.isfile(resolved):
+            resolved = os.path.abspath(file_path)
+
+        if not os.path.isfile(resolved):
+            print(f"Error: File not found: {file_path}", file=sys.stderr)
+            print(f"  Tried: {os.path.join(project_path, file_path)}", file=sys.stderr)
+            return 1
+
+        args.entry_data = (os.path.abspath(resolved), line, character)
 
         if line < 0:
             print(f"Error: Line number must be non-negative: {line}", file=sys.stderr)
