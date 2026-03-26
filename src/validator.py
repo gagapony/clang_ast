@@ -179,61 +179,6 @@ def validate_function_name(function_name: str) -> ValidationResult:
     return ValidationResult.success()
 
 
-def validate_scope_root(project_path: str, scope_root: Optional[str] = None) -> str:
-    """
-    Validate and resolve scope root directory.
-
-    If scope_root is None, default to project root.
-    Returns absolute path of scope root.
-
-    Args:
-        project_path: Absolute path to project directory
-        scope_root: Scope root path relative to project, or None
-
-    Returns:
-        Absolute path to scope root directory
-
-    Raises:
-        ValueError: If scope root is not a valid directory
-    """
-    if scope_root is None:
-        return project_path
-
-    # Resolve relative to project path
-    if os.path.isabs(scope_root):
-        abs_scope = scope_root
-    else:
-        abs_scope = os.path.join(project_path, scope_root)
-
-    abs_scope = os.path.abspath(abs_scope)
-
-    # Validate scope root exists and is within project
-    if not os.path.exists(abs_scope):
-        raise ValueError(
-            f"Scope root directory does not exist: {abs_scope}"
-        )
-
-    if not os.path.isdir(abs_scope):
-        raise ValueError(
-            f"Scope root is not a directory: {abs_scope}"
-        )
-
-    # Ensure scope root is within project path
-    try:
-        common_path = os.path.commonpath([abs_scope, project_path])
-        if common_path != project_path:
-            raise ValueError(
-                f"Scope root must be within project directory: {abs_scope}"
-            )
-    except ValueError:
-        # On different drives (Windows) or filesystems
-        raise ValueError(
-            f"Scope root must be within project directory: {abs_scope}"
-        )
-
-    return abs_scope
-
-
 def validate_project_structure(
     project_path: str,
     config_path: Optional[str] = None

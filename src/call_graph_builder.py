@@ -38,7 +38,7 @@ class CallGraphBuilder:
         self,
         clangd_client: ClangdClient,
         filter_config: FilterConfig,
-        scope_root: str,
+        project_path: str,
         max_depth: int = 100,
         max_nodes: int = 10000,
         verbose: bool = False,
@@ -49,8 +49,8 @@ class CallGraphBuilder:
 
         Args:
             clangd_client: Clangd JSON-RPC client
-            filter_config: Filter configuration
-            scope_root: Root directory for scope control
+            filter_config: Filter configuration (defines scope + file inclusion)
+            project_path: Project root directory (for fallback search)
             max_depth: Maximum recursion depth
             max_nodes: Maximum nodes to process
             verbose: Enable verbose logging
@@ -58,7 +58,7 @@ class CallGraphBuilder:
         """
         self.client = clangd_client
         self.filter_config = filter_config
-        self.scope_root = os.path.abspath(scope_root)
+        self.project_path = os.path.abspath(project_path)
         self.max_depth = max_depth
         self.max_nodes = max_nodes
         self.verbose = verbose
@@ -76,7 +76,7 @@ class CallGraphBuilder:
         # Track opened files
         self.opened_files: Set[str] = set()
 
-        self._log(f"CallGraphBuilder initialized, scope_root={self.scope_root}")
+        self._log(f"CallGraphBuilder initialized, filter_rules={len(self.filter_config.rules)}")
 
     def _log(self, message: str) -> None:
         """Log message if verbose mode is enabled."""
@@ -259,6 +259,10 @@ class CallGraphBuilder:
 
                 # Look for brief comment above function definition
                 brief = self._extract_brief_comment(lines, idx)
+
+                # Reject brief that's just the function name (redundant)
+                if brief and brief.lower() == default_name.lower():
+                    brief = ""
         except Exception:
             pass
 
@@ -266,105 +270,63 @@ class CallGraphBuilder:
 
     def _extract_brief_comment(self, lines: List[str], def_line_idx: int) -> str:
         """
-        Extract brief comment above a function definition.
+        Extract brief from /** @brief ... */ block above function definition.
 
-        Supports:
-        - Single-line: // brief text
-        - Doxygen: /** @brief text */ (single line)
-        - Doxygen multi-line:
-          /**
-           * @brief text
-           */
-        - Block comment:
-          /*
-           * text
-           */
-
-        Args:
-            lines: File lines
-            def_line_idx: Index of function definition line (0-based)
-
-        Returns:
-            Brief comment text (stripped of markers), or empty string
+        Rules:
+        - ONLY extracts from /** ... */ blocks containing @brief
+        - Everything between @brief and next @tag (or end of block) is the brief
+        - Multi-line joined with spaces, * prefixes stripped
+        - All other comments (//, /* */, license, etc.) are IGNORED
         """
-        # First: check if the line immediately above is a closing block comment
-        # e.g. " */" or "/** @brief ... */"
-        search_limit = max(0, def_line_idx - 12)
-
-        comment_lines = []
-        in_block_comment = False
-
-        for i in range(def_line_idx - 1, search_limit - 1, -1):
-            line = lines[i].strip()
-
-            # Empty line: allow within block comments, stop otherwise
-            if not line:
-                if in_block_comment:
-                    continue
+        # Find closing */ above function definition (up to 8 lines)
+        closing_idx = None
+        for i in range(def_line_idx - 1, max(-1, def_line_idx - 8), -1):
+            if i < 0 or i >= len(lines):
+                break
+            if lines[i].strip().endswith('*/'):
+                closing_idx = i
                 break
 
-            # Check for code-like content that shouldn't be in a comment
-            # (preprocessor directives, braces, semicolons as statement ends)
-            if not in_block_comment and not line.startswith('//'):
-                # If not starting a comment, this might be code
-                if line.startswith('#') or line == '{' or line == '}':
-                    break
-
-            if line.endswith('*/'):
-                in_block_comment = True
-                content = re.sub(r'\*/$', '', line).strip()
-                content = re.sub(r'^/\*{0,2}\s*', '', content).strip()
-                content = content.lstrip('*').strip()
-                # Skip code-like, preprocessor, or trivial comments
-                if content and not re.search(r'[{}#;]', content) and len(content) > 3:
-                    comment_lines.insert(0, content)
-                continue
-
-            if in_block_comment:
-                if line.startswith('/*') or line.startswith('/**'):
-                    content = re.sub(r'^/\*{0,2}\s*', '', line).strip()
-                    content = content.lstrip('*').strip()
-                    if content and not re.search(r'[{}#;]', content) and len(content) > 3:
-                        comment_lines.insert(0, content)
-                    break
-                # Middle line of block comment - strip leading *
-                content = re.sub(r'^\s*\*+\s?', '', line).strip()
-                # Skip lines that look like code (contain {, }, #, ;)
-                if content and not re.search(r'[{}#;]', content) and len(content) > 3:
-                    comment_lines.insert(0, content)
-                continue
-
-            if line.startswith('//'):
-                content = line.lstrip('/').strip()
-                comment_lines.insert(0, content)
-                break
-
-            # Non-comment line: stop
-            break
-
-        if not comment_lines:
+        if closing_idx is None:
             return ""
 
-        # Join all comment lines
-        full_comment = ' '.join(comment_lines)
+        # Collect lines from closing */ upward to opening /**/
+        block_lines = []
+        found_opening = False
+        for i in range(closing_idx, max(-1, closing_idx - 20), -1):
+            line = lines[i].strip()
+            block_lines.insert(0, line)
+            if line.startswith('/**'):
+                found_opening = True
+                break
 
-        # Extract @brief if present (Doxygen style)
-        brief_match = re.search(r'@brief\s+(.+?)(?:\s+@\w+|$)', full_comment)
-        if brief_match:
-            brief = brief_match.group(1).strip()
-        else:
-            brief = full_comment.strip()
+        if not found_opening:
+            return ""
 
-        # Sanitize: remove URLs, code fragments, overly long content
-        brief = re.sub(r'https?://\S+', '', brief).strip()
-        brief = re.sub(r'\bSource:\s*', '', brief).strip()
+        # Join all lines, strip * prefixes
+        parts = []
+        for line in block_lines:
+            content = re.sub(r'^/\*{0,2}\s*', '', line)
+            content = re.sub(r'\*/$', '', content)
+            content = re.sub(r'^\s*\*+\s?', '', content)
+            content = content.strip()
+            if content:
+                parts.append(content)
+
+        if not parts:
+            return ""
+
+        full_text = ' '.join(parts)
+
+        # Extract @brief content: everything from @brief to next @tag or end
+        match = re.search(r'@brief\s+(.+?)(?:\s+@\w+|$)', full_text, re.DOTALL)
+        if not match:
+            return ""
+
+        brief = match.group(1).strip()
         brief = re.sub(r'\s+', ' ', brief)
 
-        # Skip if comment is just a filename reference (e.g., "u8g2_buffer.c")
-        if re.match(r'^[\w./\\-]+\.(c|cpp|cc|cxx|h|hpp|hxx)$', brief, re.IGNORECASE):
-            return ""
-
-        # Truncate to reasonable length (first sentence or 120 chars)
+        # Truncate: first sentence or 120 chars
         sentence_end = re.search(r'[.!?。]\s', brief)
         if sentence_end and sentence_end.end() < 120:
             brief = brief[:sentence_end.end()].strip()
@@ -403,18 +365,17 @@ class CallGraphBuilder:
         return defs
 
     def _is_in_scope(self, file_path: str) -> bool:
-        """Check if file is within scope root."""
-        try:
-            abs_path = os.path.abspath(file_path)
-            return os.path.commonpath([self.scope_root, abs_path]) == self.scope_root
-        except ValueError:
-            return False
+        """Check if file is within scope (defined by filter.cfg)."""
+        return self._should_include(file_path)
 
     def _should_include(self, file_path: str) -> bool:
-        """Check if file should be included based on filter config."""
-        if not self.filter_config.rules:
-            return True
-        return self.filter_config.should_include(os.path.abspath(file_path))
+        """Check if file should be included based on filter config (relative to project root)."""
+        abs_path = os.path.abspath(file_path)
+        try:
+            rel_path = os.path.relpath(abs_path, self.project_path)
+        except ValueError:
+            rel_path = abs_path
+        return self.filter_config.should_include(rel_path)
 
     def _register_node(
         self,
@@ -600,19 +561,18 @@ class CallGraphBuilder:
 
                                 cb_path = self.client._uri_to_path(target_uri)
 
-                                if self._should_include(cb_path):
-                                    cb_id = self._register_node(cb_path, start_line_0 + 1, cb_name)
+                                cb_id = self._register_node(cb_path, start_line_0 + 1, cb_name)
 
-                                    edge_key = (caller_id, cb_id)
-                                    if edge_key not in self.processed_outgoing:
-                                        self.processed_outgoing.add(edge_key)
-                                        self._add_edge(caller_id, cb_id)
+                                edge_key = (caller_id, cb_id)
+                                if edge_key not in self.processed_outgoing:
+                                    self.processed_outgoing.add(edge_key)
+                                    self._add_edge(caller_id, cb_id)
 
-                                        if self._is_in_scope(cb_path):
-                                            self._ensure_file_opened(cb_path)
-                                            self._build_outgoing(target_uri, cb_name, start_line_0, cb_id, current_depth + 1)
-                                        else:
-                                            self._log(f"  Not recursing into external callback: {cb_name} @ {cb_path}")
+                                    if self._is_in_scope(cb_path):
+                                        self._ensure_file_opened(cb_path)
+                                        self._build_outgoing(target_uri, cb_name, start_line_0, cb_id, current_depth + 1)
+                                    else:
+                                        self._log(f"  External callback: {cb_name} @ {cb_path}")
 
                 continue  # Skip normal processing for callback APIs
 
@@ -640,85 +600,74 @@ class CallGraphBuilder:
 
             callee_path = self.client._uri_to_path(target_uri)
 
-            # Check if should include this file
-            if not self._should_include(callee_path):
-                # Still register the node and edge, but don't recurse
-                self._log(f"  Skipping out-of-scope: {callee_name} @ {callee_path}")
-                continue
-
-            self._log(f"  Resolving: {callee_name} @ {callee_path}")
-
-            # Check if callee is within caller's function body
-            # This handles cases where Clangd returns declaration instead of definition
-            in_body = (start_0 <= start_line_0 <= end_0)
-            self._log(f"  Definition check: caller_lines={start_0}-{end_0}, callee_line={start_line_0}, in_body={in_body}")
-
-            if not in_body:
-                # Callee definition is outside caller's function body
-                # Likely a forward declaration or member function declared in header
-                # Try to search for actual definition in the same file
-                self._log(f"  Warning: Definition at line {start_line_0} is outside caller body (caller lines: {start_0}-{end_0})")
-                # Search for actual definition
-                actual_def_line = self._search_for_definition_in_file(
-                    callee_path, callee_name
-                )
-                if actual_def_line is None and '::' in callee_name:
-                    # Try base name (strip namespace/class prefix)
-                    base_name = callee_name.split('::')[-1]
-                    self._log(f"  Retrying with base name: {base_name}")
-                    actual_def_line = self._search_for_definition_in_file(
-                        callee_path, base_name
-                    )
-                # If clangd returned a header declaration, search the .cpp counterpart
-                if actual_def_line is None and callee_path.endswith(('.h', '.hpp')):
-                    cpp_candidates = []
-                    base = callee_path.rsplit('.', 1)[0]
-                    for ext in ('.cpp', '.cc', '.cxx', '.c'):
-                        cpp_candidates.append(base + ext)
-                    # Also check in the caller's directory
-                    caller_dir = os.path.dirname(caller_path)
-                    basename = os.path.basename(base)
-                    for ext in ('.cpp', '.cc', '.cxx', '.c'):
-                        cpp_candidates.append(os.path.join(caller_dir, basename + ext))
-                    for cpp_path in cpp_candidates:
-                        if os.path.isfile(cpp_path):
-                            self._log(f"  Trying .cpp counterpart: {cpp_path}")
-                            actual_def_line = self._search_for_definition_in_file(
-                                cpp_path, callee_name
-                            )
-                            if actual_def_line is None and '::' in callee_name:
-                                actual_def_line = self._search_for_definition_in_file(
-                                    cpp_path, callee_name.split('::')[-1]
-                                )
-                            if actual_def_line is not None:
-                                callee_path = cpp_path
-                                target_uri = self.client._path_to_uri(cpp_path)
-                                break
-                if actual_def_line is not None:
-                    # Found actual definition, use it
-                    start_line_0 = actual_def_line
-                    self._log(f"  Using actual definition at line {actual_def_line}")
-                else:
-                    # Couldn't find better definition, skip this call
-                    self._log(f"  Skipping: couldn't find definition for {callee_name} in function body")
-                    continue
-
-            # Register callee node
-            callee_id = self._register_node(callee_path, start_line_0 + 1, callee_name)
-
-            # Add edge
-            edge_key = (caller_id, callee_id)
-            if edge_key in self.processed_outgoing:
-                continue
-            self.processed_outgoing.add(edge_key)
-            self._add_edge(caller_id, callee_id)
-
-            # Only recurse if in scope
+            # Only recurse if in scope (defined by filter.cfg)
             if self._is_in_scope(callee_path):
+                # In-scope: resolve actual definition, then register + recurse
+
+                # Check if callee is within caller's function body
+                # This handles cases where Clangd returns declaration instead of definition
+                in_body = (start_0 <= start_line_0 <= end_0)
+                self._log(f"  Definition check: caller_lines={start_0}-{end_0}, callee_line={start_line_0}, in_body={in_body}")
+
+                if not in_body:
+                    # Try to search for actual definition in the same file
+                    self._log(f"  Warning: Definition at line {start_line_0} is outside caller body")
+                    actual_def_line = self._search_for_definition_in_file(
+                        callee_path, callee_name
+                    )
+                    if actual_def_line is None and '::' in callee_name:
+                        base_name = callee_name.split('::')[-1]
+                        self._log(f"  Retrying with base name: {base_name}")
+                        actual_def_line = self._search_for_definition_in_file(
+                            callee_path, base_name
+                        )
+                    if actual_def_line is None and callee_path.endswith(('.h', '.hpp')):
+                        cpp_candidates = []
+                        base = callee_path.rsplit('.', 1)[0]
+                        for ext in ('.cpp', '.cc', '.cxx', '.c'):
+                            cpp_candidates.append(base + ext)
+                        caller_dir = os.path.dirname(caller_path)
+                        basename = os.path.basename(base)
+                        for ext in ('.cpp', '.cc', '.cxx', '.c'):
+                            cpp_candidates.append(os.path.join(caller_dir, basename + ext))
+                        for cpp_path in cpp_candidates:
+                            if os.path.isfile(cpp_path):
+                                self._log(f"  Trying .cpp counterpart: {cpp_path}")
+                                actual_def_line = self._search_for_definition_in_file(
+                                    cpp_path, callee_name
+                                )
+                                if actual_def_line is None and '::' in callee_name:
+                                    actual_def_line = self._search_for_definition_in_file(
+                                        cpp_path, callee_name.split('::')[-1]
+                                    )
+                                if actual_def_line is not None:
+                                    callee_path = cpp_path
+                                    target_uri = self.client._path_to_uri(cpp_path)
+                                    break
+                    if actual_def_line is not None:
+                        start_line_0 = actual_def_line
+                        self._log(f"  Using actual definition at line {actual_def_line}")
+                    else:
+                        self._log(f"  Skipping: couldn't find definition for {callee_name}")
+                        continue
+
+                # Register node and recurse
+                callee_id = self._register_node(callee_path, start_line_0 + 1, callee_name)
+                edge_key = (caller_id, callee_id)
+                if edge_key not in self.processed_outgoing:
+                    self.processed_outgoing.add(edge_key)
+                    self._add_edge(caller_id, callee_id)
+
                 self._ensure_file_opened(callee_path)
                 self._build_outgoing(target_uri, callee_name, start_line_0, callee_id, current_depth + 1)
             else:
-                self._log(f"  Not recursing into external: {callee_name} @ {callee_path}")
+                # Out of scope (EXTERNAL): register as leaf, no recursion
+                callee_id = self._register_node(callee_path, start_line_0 + 1, callee_name)
+                edge_key = (caller_id, callee_id)
+                if edge_key not in self.processed_outgoing:
+                    self.processed_outgoing.add(edge_key)
+                    self._add_edge(caller_id, callee_id)
+                self._log(f"  External: {callee_name} @ {callee_path}")
 
     def _resolve_callback_parameter(
         self,
@@ -860,12 +809,6 @@ class CallGraphBuilder:
             )
 
             if caller_name == target_name or caller_name == "UnknownContext":
-                continue
-
-            # Check if should include this file
-            if not self._should_include(caller_path):
-                # Still register to show caller, but don't recurse
-                self._log(f"  Skipping out-of-scope caller: {caller_path}")
                 continue
 
             # Register caller node
@@ -1041,6 +984,8 @@ class CallGraphBuilder:
         """
         Fallback method to find function by searching source files.
 
+        Only searches files matching filter.cfg rules.
+
         Args:
             function_name: Function name to find
 
@@ -1049,60 +994,59 @@ class CallGraphBuilder:
         """
         import glob
 
-        # Try common source directories
-        search_paths = [
-            "main.cpp",
-            "src/main.cpp",
-            "src/*.cpp",
-            "lib/*.cpp",
-            "*.cpp"
-        ]
+        # Search recursively from current directory, filter by config
+        search_patterns = ["**/*.cpp", "**/*.c", "**/*.cc", "**/*.cxx"]
 
-        for pattern in search_paths:
-            full_pattern = os.path.join(self.scope_root, pattern)
-            for file_path in glob.glob(full_pattern, recursive=True):
-                if os.path.isfile(file_path):
-                    # Open document first
-                    self._ensure_file_opened(file_path)
+        for pattern in search_patterns:
+            for file_path in glob.glob(os.path.join(self.project_path, pattern), recursive=True):
+                abs_path = os.path.abspath(file_path)
+                if not os.path.isfile(abs_path):
+                    continue
+                # Only search files allowed by filter.cfg
+                if not self._should_include(abs_path):
+                    continue
 
-                    uri = self.client._path_to_uri(file_path)
-                    try:
-                        symbols = self.client.textDocument_documentSymbol(uri)
-                        for symbol in symbols:
-                            if symbol.get("name") == function_name:
-                                kind = symbol.get("kind", 0)
-                                if kind in (5, 12, 9, 10):  # Method, Function, Constructor, Destructor
-                                    # Handle different LSP response formats
-                                    location = symbol.get("location", {})
-                                    if not location:
-                                        location = {
-                                            "uri": uri,
-                                            "range": symbol.get("range", {})
-                                        }
+                # Open document first
+                self._ensure_file_opened(abs_path)
 
-                                    # Convert to workspace/symbol format
-                                    range_info = location.get("range", {})
-                                    start_info = range_info.get("start", {})
-                                    line_0 = start_info.get("line", 0)
+                uri = self.client._path_to_uri(abs_path)
+                try:
+                    symbols = self.client.textDocument_documentSymbol(uri)
+                    for symbol in symbols:
+                        if symbol.get("name") == function_name:
+                            kind = symbol.get("kind", 0)
+                            if kind in (5, 12, 9, 10):  # Method, Function, Constructor, Destructor
+                                # Handle different LSP response formats
+                                location = symbol.get("location", {})
+                                if not location:
+                                    location = {
+                                        "uri": uri,
+                                        "range": symbol.get("range", {})
+                                    }
 
-                                    # Search backwards to find actual function definition line
-                                    # (LSP may return range of function body, not definition line)
-                                    actual_line_0 = self._find_function_definition_line(
-                                        file_path, function_name, line_0
-                                    )
+                                # Convert to workspace/symbol format
+                                range_info = location.get("range", {})
+                                start_info = range_info.get("start", {})
+                                line_0 = start_info.get("line", 0)
 
-                                    character_0 = self._find_function_name_position(
-                                        file_path, function_name, actual_line_0
-                                    )
+                                # Search backwards to find actual function definition line
+                                # (LSP may return range of function body, not definition line)
+                                actual_line_0 = self._find_function_definition_line(
+                                    abs_path, function_name, line_0
+                                )
 
-                                    self._log(
-                                        f"Found '{function_name}' in {file_path}:{actual_line_0}:{character_0}"
-                                    )
+                                character_0 = self._find_function_name_position(
+                                    abs_path, function_name, actual_line_0
+                                )
 
-                                    # Delegate to position-based build
-                                    return self.build(file_path, actual_line_0, character_0)
-                    except Exception as e:
-                        self._log(f"Error searching {file_path}: {e}")
+                                self._log(
+                                    f"Found '{function_name}' in {abs_path}:{actual_line_0}:{character_0}"
+                                )
+
+                                # Delegate to position-based build
+                                return self.build(abs_path, actual_line_0, character_0)
+                except Exception as e:
+                    self._log(f"Error searching {abs_path}: {e}")
 
         self._log(f"Function not found: {function_name}")
         return None

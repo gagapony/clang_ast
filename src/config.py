@@ -49,14 +49,18 @@ class FilterConfig:
 
         Returns True if included, False if excluded.
         First match wins (rules are processed in order).
-        If no rule matches, default to True (include all).
+
+        If include rules (+) exist and no rule matches: exclude (False).
+        If only exclude rules (-) exist and no rule matches: include (True).
+        If no rules: include all (True).
         """
         for rule in self.rules:
             if rule.matches(path):
                 return rule.action == '+'
 
-        # Default: include if no rule matches
-        return True
+        # No rule matched: check if include rules exist
+        has_include_rules = any(r.action == '+' for r in self.rules)
+        return not has_include_rules
 
     @staticmethod
     def from_file(file_path: str) -> 'FilterConfig':

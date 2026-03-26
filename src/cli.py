@@ -64,8 +64,8 @@ Examples:
   # Function name mode
   python main.py -p /path/to/project -e "setup"
 
-  # With custom scope and depth
-  python main.py -p /path/to/project -e "setup" -s src/ -d 3
+  # With custom filter and depth
+  python main.py -p /path/to/project -e "setup" -c filter.cfg -d 3
 
   # JSON output
   python main.py -p /path/to/project -e "setup" -f json -o call_graph.json
@@ -87,17 +87,10 @@ Examples:
     )
 
     parser.add_argument(
-        '-s', '--scope',
-        type=str,
-        default=None,
-        help='Root directory for scope control (default: project root)'
-    )
-
-    parser.add_argument(
         '-c', '--config',
         type=str,
         default='filter.cfg',
-        help='Filter configuration file (default: filter.cfg)'
+        help='Filter configuration file - defines scope (default: filter.cfg)'
     )
 
     parser.add_argument(
@@ -188,14 +181,6 @@ def validate_arguments(args: argparse.Namespace) -> int:
         print(f"Error: {result.message}", file=sys.stderr)
         return 1
 
-    # Validate scope root
-    try:
-        from .validator import validate_scope_root
-        validate_scope_root(os.path.abspath(args.path), args.scope)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        return 1
-
     # Validate max depth
     if args.max_depth <= 0:
         print("Error: max-depth must be positive", file=sys.stderr)
@@ -232,7 +217,6 @@ def main() -> int:
             print(f"Entry point: {file_path}:{line}:{character}")
         else:
             print(f"Entry function: {args.entry_data}")
-        print(f"Scope: {args.scope or 'project root'}")
         print(f"Config: {args.config}")
         print(f"Output: {args.output or 'stdout'}")
         print(f"Format: {args.format}")
@@ -273,15 +257,11 @@ def main() -> int:
         return 1
 
     try:
-        # Initialize scope root
-        scope_root = args.scope if args.scope else project_path
-        scope_root = os.path.abspath(scope_root)
-
         # Initialize builder
         builder = CallGraphBuilder(
             clangd_client=client,
             filter_config=filter_config,
-            scope_root=scope_root,
+            project_path=project_path,
             max_depth=args.max_depth,
             max_nodes=args.max_nodes,
             verbose=args.verbose,
