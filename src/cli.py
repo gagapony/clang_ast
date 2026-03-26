@@ -118,9 +118,9 @@ Examples:
     parser.add_argument(
         '-f', '--format',
         type=str,
-        choices=['text', 'json'],
+        choices=['text', 'json', 'all'],
         default='text',
-        help='Output format: text (indented tree) or json (adjacency list) (default: text)'
+        help='Output format: text, json, or all (both, requires -o) (default: text)'
     )
 
     parser.add_argument(
@@ -291,10 +291,8 @@ def main() -> int:
             return 1
 
         # Generate output
-        if args.format == 'json':
-            output = builder.to_json()
-        else:
-            output = builder.to_tree_text(root_id, max_display_depth=args.max_depth)
+        text_output = builder.to_tree_text(root_id, max_display_depth=args.max_depth)
+        json_output = builder.to_json()
 
         # Print stats
         stats = builder.get_stats()
@@ -307,7 +305,22 @@ def main() -> int:
             print()
 
         # Write output
-        if args.output:
+        if args.format == 'all':
+            if not args.output:
+                print("Error: -f all requires -o to specify output base name", file=sys.stderr)
+                return 1
+            for ext, content in [('.txt', text_output), ('.json', json_output)]:
+                out_path = args.output + ext
+                try:
+                    with open(out_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    if args.verbose:
+                        print(f"Output written to: {out_path}")
+                except IOError as e:
+                    print(f"Error writing {out_path}: {e}", file=sys.stderr)
+                    return 1
+        elif args.output:
+            output = json_output if args.format == 'json' else text_output
             try:
                 with open(args.output, 'w', encoding='utf-8') as f:
                     f.write(output)
@@ -317,7 +330,7 @@ def main() -> int:
                 print(f"Error writing output file: {e}", file=sys.stderr)
                 return 1
         else:
-            print(output)
+            print(json_output if args.format == 'json' else text_output)
 
         return 0
 
