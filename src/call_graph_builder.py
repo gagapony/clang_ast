@@ -268,6 +268,27 @@ class CallGraphBuilder:
 
         return qualified_name, brief
 
+    def _fallback_search_definition(self, function_name: str) -> Optional[Tuple[str, int]]:
+        """
+        Search project files for a function definition by name.
+
+        Returns:
+            (file_path, line_0) or None
+        """
+        import glob
+        search_patterns = ["**/*.cpp", "**/*.c", "**/*.cc", "**/*.cxx"]
+        for pattern in search_patterns:
+            for file_path in glob.glob(os.path.join(self.project_path, pattern), recursive=True):
+                abs_path = os.path.abspath(file_path)
+                if not os.path.isfile(abs_path):
+                    continue
+                if not self._should_include(abs_path):
+                    continue
+                line_0 = self._search_for_definition_in_file(abs_path, function_name)
+                if line_0 is not None:
+                    return (abs_path, line_0)
+        return None
+
     def _extract_brief_comment(self, lines: List[str], def_line_idx: int) -> str:
         """
         Extract brief from /** @brief ... */ block above function definition.
@@ -489,9 +510,16 @@ class CallGraphBuilder:
                     obj_name = match.group(1)
                     method_name = match.group(2)
                     if method_name not in keywords and obj_name not in keywords:
-                        from .callback_config import is_callback_api
+                        from .callback_config import is_callback_api, _get_config
                         is_callback, _ = is_callback_api(method_name, self.callback_config)
-                        calls.append((method_name, i, match.start(2), is_callback))
+                        # Pass 5: Check func_map for this member call
+                        cfg = _get_config(self.callback_config)
+                        found, targets = cfg.is_func_ptr_call(obj_name, method_name)
+                        if found and targets:
+                            # Mark as func_map type with targets encoded
+                            calls.append((method_name, i, match.start(2), "func_map", targets))
+                        else:
+                            calls.append((method_name, i, match.start(2), is_callback))
 
                 # Pass 4: Find pointer member calls obj->method(...)
                 for match in re.finditer(r'\b([a-zA-Z_]\w*)->([a-zA-Z_]\w*)\s*\(', line):
@@ -501,6 +529,22 @@ class CallGraphBuilder:
                         from .callback_config import is_callback_api
                         is_callback, _ = is_callback_api(method_name, self.callback_config)
                         calls.append((method_name, i, match.start(2), is_callback))
+
+                # Pass 6: Detect ioctl-like calls matching configured format pattern
+                from .callback_config import _get_config
+                cfg = _get_config(self.callback_config)
+                ioctl_re = cfg.parse_ioctl_format()
+                if ioctl_re:
+                    ioctl_commands = cfg.load()["ioctl_map"].get("commands", {})
+                    for match in ioctl_re.finditer(line):
+                        # Find which captured group matches a known command
+                        for group in match.groups():
+                            cmd = group.strip()
+                            if cmd in ioctl_commands:
+                                handler = ioctl_commands[cmd]
+                                calls.append((handler, i, match.start(), "ioctl"))
+                                break
+
 
         except Exception as e:
             self._log(f"Error finding calls: {e}")
@@ -533,7 +577,55 @@ class CallGraphBuilder:
 
         self._log(f"  Found {len(calls)} calls in {caller_name}")
 
-        for callee_name, line_idx, char_idx, is_callback_api in calls:
+        for call_info in calls:
+            # Unpack: standard is (name, line, char, is_callback), func_map adds targets
+            callee_name = call_info[0]
+            line_idx = call_info[1]
+            char_idx = call_info[2]
+            call_type = call_info[3]
+
+            # ── func_map: direct resolution to mapped targets ──
+            if call_type == "func_map":
+                targets = call_info[4]  # list of function names
+                self._log(f"  func_map match: {callee_name} → {targets}")
+                for target_name in targets:
+                    # Search for target definition in project files
+                    actual_def_line = self._fallback_search_definition(target_name)
+                    if actual_def_line is not None:
+                        t_path, t_line = actual_def_line
+                        callee_id = self._register_node(t_path, t_line + 1, target_name)
+                        edge_key = (caller_id, callee_id)
+                        if edge_key not in self.processed_outgoing:
+                            self.processed_outgoing.add(edge_key)
+                            self._add_edge(caller_id, callee_id)
+                            if self._is_in_scope(t_path):
+                                t_uri = self.client._path_to_uri(t_path)
+                                self._ensure_file_opened(t_path)
+                                self._build_outgoing(t_uri, target_name, t_line, callee_id, current_depth + 1)
+                            else:
+                                self._log(f"  External func_map target: {target_name} @ {t_path}")
+                continue
+
+            # ── ioctl: handler resolved during call detection ──
+            if call_type == "ioctl":
+                handler_name = callee_name  # already the resolved handler
+                self._log(f"  ioctl match: handler={handler_name}")
+                actual_def_line = self._fallback_search_definition(handler_name)
+                if actual_def_line is not None:
+                    h_path, h_line = actual_def_line
+                    callee_id = self._register_node(h_path, h_line + 1, handler_name)
+                    edge_key = (caller_id, callee_id)
+                    if edge_key not in self.processed_outgoing:
+                        self.processed_outgoing.add(edge_key)
+                        self._add_edge(caller_id, callee_id)
+                        if self._is_in_scope(h_path):
+                            h_uri = self.client._path_to_uri(h_path)
+                            self._ensure_file_opened(h_path)
+                            self._build_outgoing(h_uri, handler_name, h_line, callee_id, current_depth + 1)
+                continue
+
+            is_callback_api = call_type  # boolean for normal calls
+
             # Special handling for callback APIs
             if is_callback_api:
                 # Try to resolve callback function (indirect call)

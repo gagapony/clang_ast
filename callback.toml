@@ -1,0 +1,87 @@
+# callback.toml - Indirect call resolution config for clangd-call-tree
+#
+# This file defines how to resolve indirect calls that clangd cannot resolve:
+#   1. [param_in]  - Callback API parameter mapping
+#   2. [func_map]  - Function pointer struct field → implementations
+#   3. [ioctl_map] - ioctl-like command → handler function
+#
+# All paths are relative to the project root (-p).
+
+# ──────────────────────────────────────────────
+# Section 1: Callback API parameter index
+# ──────────────────────────────────────────────
+# Maps API function name → which parameter (0-based) contains the callback.
+# The tool will resolve the callback function and continue traversal.
+#
+# Example: xTaskCreate(taskFunc, ...) → parameter 0 is the callback
+
+# FreeRTOS APIs
+[param_in]
+xTaskCreate = 0
+xTaskCreateStatic = 0
+xTaskCreatePinnedToCore = 0
+
+# POSIX APIs
+pthread_create = 1
+atexit = 0
+signal = 1
+
+# C++ Threading
+"std::thread::thread" = 0
+"std::async" = 0
+
+# Arduino / ESP32
+attachInterrupt = 0
+setTimeout = 0
+setInterval = 0
+
+# Common patterns
+registerCallback = 0
+setCallback = 0
+addEventListener = 1
+addListener = 1
+on = 1
+once = 1
+off = 1
+
+# Event handling patterns
+emit = 1
+
+# ──────────────────────────────────────────────
+# Section 2: Function pointer → implementations
+# ──────────────────────────────────────────────
+# When code calls a struct function pointer (obj.field.method(...)),
+# map it to the possible concrete implementations.
+#
+# Key: dotted path to the function pointer field
+# Value: list of possible target function names
+#
+# Example code:
+#   g_stWrapIntf.stWrapLdc.SetLDCAttr(devId, chnId, &attr);
+#
+# The tool resolves this to BOTH implementations as sibling callees.
+#
+# [func_map]
+# g_stWrapIntf.stWrapLdc.SetLDCAttr = [
+#     "MI_LDC_SetChnLDCAttr_EPTZ",
+#     "MI_LDC_SetChnLDCAttr_CV"
+# ]
+
+# ──────────────────────────────────────────────
+# Section 3: ioctl-like command → handler
+# ──────────────────────────────────────────────
+# When code calls an ioctl wrapper function, resolve the command
+# to its actual handler function.
+#
+# 'format': the call pattern where * is a wildcard
+# Other keys: command_constant → handler_function
+#
+# Example code:
+#   MI_SYSCALL_SOCID(0, LDC_IOC_SET_ATTR, &param)
+# Matches format pattern, extracts LDC_IOC_SET_ATTR,
+# resolves to MI_LDC_SetChnLDCAttr.
+#
+# [ioctl_map]
+# format = "MI_SYSCALL_SOCID(*,*,*)"
+# LDC_IOC_SET_ATTR = "MI_LDC_SetChnLDCAttr"
+# LDC_IOC_GET_STATUS = "MI_LDC_GetChnLDCAttr"
