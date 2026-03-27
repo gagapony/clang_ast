@@ -50,22 +50,37 @@ emit = 1
 # ──────────────────────────────────────────────
 # Section 2: Function pointer → implementations
 # ──────────────────────────────────────────────
-# When code calls a struct function pointer (obj.field.method(...)),
-# map it to the possible concrete implementations.
+# Structure: func_map → group → {path, expression → targets}
 #
-# Key: dotted path to the function pointer field
-# Value: list of possible target function names
+# path: directory to search for target function definitions (non-recursive)
+# expression: full expression as it appears in code (pC->FreeBins, obj.Method)
+# targets: list of actual function names
 #
-# Example code:
-#   g_stWrapIntf.stWrapLdc.SetLDCAttr(devId, chnId, &attr);
-#
-# The tool resolves this to BOTH implementations as sibling callees.
-#
-# [func_map]
-# g_stWrapIntf.stWrapLdc.SetLDCAttr = [
-#     "MI_LDC_SetChnLDCAttr_EPTZ",
-#     "MI_LDC_SetChnLDCAttr_CV"
-# ]
+# Multiple groups can share or differ in search paths.
+
+[func_map]
+
+[func_map.ldc_wrapper]
+path = "sdk/interface/src/ldc/wrapper"
+g_stWrapIntf.stWrapLdc.SetLDCAttr = ["LDC_WRAPPER_LDC_SetChnLDCAttr"]
+
+[func_map.genbin]
+path = "sdk/interface/src/ldc/wrapper/src"
+"pC->Init" = ["LDC_EPTZ_Init", "LDC_CVLIB_Init", "LDC_EIS_EPTZ_Init"]
+"pC->DeInit" = ["LDC_EPTZ_DeInit", "LDC_CVLIB_DeInit", "LDC_EIS_EPTZ_DeInit"]
+"pC->UpdateCfg" = ["LDC_EPTZ_UpdateCfg", "LDC_CVLIB_UpdateCfg", "LDC_EIS_EPTZ_UpdateCfg"]
+"pC->GenBins" = ["LDC_EPTZ_GenBins", "LDC_CVLIB_GenBins", "LDC_EIS_EPTZ_GenBins"]
+"pC->FreeBins" = ["LDC_EPTZ_FreeBins", "LDC_CVLIB_FreeBins", "LDC_EIS_EPTZ_FreeBins"]
+"pC->MapBorderInit" = ["LDC_EPTZ_MapBorderInit"]
+"pC->MapBorderDeInit" = ["LDC_EPTZ_MapBorderDeInit"]
+"pC->MapBorderGetSize" = ["LDC_EPTZ_GetMapBorderSize"]
+"pC->MapBorderGetData" = ["LDC_EPTZ_GenMapBorderData"]
+"pC->QueryMapPoints" = ["LDC_EPTZ_QueryMapPoints", "LDC_CVLIB_QueryMapPoints"]
+"pC->GetDispMapSize" = ["LDC_CVLIB_GetDispMapSize"]
+"pC->GetDispMapInfo" = ["LDC_CVLIB_GetDispMapInfo"]
+"pC->QueryMapPoint" = ["LDC_CVLIB_QueryMapPoint"]
+"pC->CalcMotion" = ["LDC_CVLIB_MotionMapCalc"]
+"pC->GetBoundaryParam" = ["LDC_EIS_EPTZ_GetBoundaryParam"]
 
 # ──────────────────────────────────────────────
 # Section 3: ioctl-like command → handler

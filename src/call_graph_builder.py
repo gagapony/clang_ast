@@ -76,12 +76,96 @@ class CallGraphBuilder:
         # Track opened files
         self.opened_files: Set[str] = set()
 
+        # Pre-resolved definition cache for indirect targets (ioctl handlers, func_map targets)
+        # Maps target_name -> (file_path, line_0)
+        self._target_def_cache: Dict[str, Tuple[str, int]] = {}
+
         self._log(f"CallGraphBuilder initialized, filter_rules={len(self.filter_config.rules)}")
 
     def _log(self, message: str) -> None:
         """Log message if verbose mode is enabled."""
         if self.verbose:
             print(f"[CallGraphBuilder] {message}")
+
+    def _pre_resolve_indirect_targets(self) -> None:
+        """
+        Pre-resolve all indirect call targets (ioctl handlers + func_map targets)
+        to avoid repeated _fallback_search_definition calls during traversal.
+        Uses search_dir from func_map to scope the search (non-recursive).
+        """
+        from .callback_config import _get_config
+
+        cfg = _get_config(self.callback_config)
+        data = cfg.load()
+
+        # Collect all unique targets with their search directories
+        # target_name -> search_dir (empty string = full project fallback)
+        target_dirs: Dict[str, str] = {}
+
+        # ioctl handlers (no dir hint, search full project)
+        ioctl_commands = data.get("ioctl_map", {}).get("commands", {})
+        for handler in ioctl_commands.values():
+            if handler not in target_dirs:
+                target_dirs[handler] = ""
+
+        # func_map targets (use search_dir from config)
+        func_map = data.get("func_map", {})
+        for expr, info in func_map.items():
+            if isinstance(info, dict):
+                search_dir = info.get("search_dir", "")
+                targets = info.get("targets", [])
+                for t in targets:
+                    if t not in target_dirs:
+                        target_dirs[t] = search_dir
+
+        if not target_dirs:
+            return
+
+        self._log(f"Pre-resolving {len(target_dirs)} indirect targets...")
+
+        resolved = 0
+        for target_name, search_dir in target_dirs.items():
+            if search_dir:
+                def_line = self._search_in_dir(search_dir, target_name)
+            else:
+                def_line = self._fallback_search_definition(target_name)
+
+            if def_line is not None:
+                self._target_def_cache[target_name] = def_line
+                resolved += 1
+                self._log(f"  Cached: {target_name} → {def_line[0]}:{def_line[1]}")
+            else:
+                self._log(f"  Not found: {target_name}")
+
+        self._log(f"Pre-resolved {resolved}/{len(target_dirs)} targets")
+
+    def _search_in_dir(self, rel_dir: str, function_name: str) -> Optional[Tuple[str, int]]:
+        """
+        Search for function definition in a specific directory (non-recursive).
+
+        Args:
+            rel_dir: Relative directory path (from project root)
+            function_name: Function name to search for
+
+        Returns:
+            (file_path, line_0) or None
+        """
+        import glob
+        abs_dir = os.path.join(self.project_path, rel_dir)
+        if not os.path.isdir(abs_dir):
+            self._log(f"  Search dir not found: {abs_dir}")
+            return None
+
+        search_patterns = ["*.c", "*.cpp", "*.cc", "*.cxx"]
+        for pattern in search_patterns:
+            for file_path in glob.glob(os.path.join(abs_dir, pattern)):
+                abs_path = os.path.abspath(file_path)
+                if not os.path.isfile(abs_path):
+                    continue
+                line_0 = self._search_for_definition_in_file(abs_path, function_name)
+                if line_0 is not None:
+                    return (abs_path, line_0)
+        return None
 
     def _make_node_id(self, file_path: str, line: int) -> str:
         """Create unique node ID from file path and line number."""
@@ -473,6 +557,12 @@ class CallGraphBuilder:
             with open(file_path, 'r', encoding='utf-8') as f:
                 lines = f.readlines()
 
+            # Load config once before the loop (not every line)
+            from .callback_config import is_callback_api, _get_config
+            cfg = _get_config(self.callback_config)
+            ioctl_re = cfg.parse_ioctl_format()
+            ioctl_commands = cfg.load().get("ioctl_map", {}).get("commands", {}) if ioctl_re else {}
+
             for i in range(max(0, start_line_0), min(end_line_0, len(lines))):
                 line = re.sub(r'//.*', '', lines[i])
 
@@ -482,7 +572,6 @@ class CallGraphBuilder:
                     func_name = match.group(1)
                     base_name = func_name.split('::')[-1]
                     if base_name not in keywords:
-                        from .callback_config import is_callback_api
                         is_callback, _ = is_callback_api(func_name, self.callback_config)
                         calls.append((func_name, i, match.start(1), is_callback))
 
@@ -496,29 +585,19 @@ class CallGraphBuilder:
                 for match in re.finditer(r'\b([a-zA-Z_]\w*)\s*\(', line):
                     func_name = match.group(1)
                     if func_name not in keywords and match.start() not in covered_ranges:
-                        # Check if this is a callback API call (use config)
-                        from .callback_config import is_callback_api
                         is_callback, _ = is_callback_api(func_name, self.callback_config)
-
-                        # Mark callback APIs, but don't skip them
-                        # (they're processed specially in _build_outgoing)
                         calls.append((func_name, i, match.start(1), is_callback))
 
                 # Pass 3: Find member calls obj.method(...), extract method name
-                # Pattern: identifier.methodName( where identifier is NOT a keyword
                 for match in re.finditer(r'(?<!::)\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\s*\(', line):
                     obj_name = match.group(1)
                     method_name = match.group(2)
                     if method_name not in keywords and obj_name not in keywords:
-                        from .callback_config import is_callback_api, _get_config
-                        is_callback, _ = is_callback_api(method_name, self.callback_config)
-                        # Pass 5: Check func_map for this member call
-                        cfg = _get_config(self.callback_config)
                         found, targets = cfg.is_func_ptr_call(obj_name, method_name)
                         if found and targets:
-                            # Mark as func_map type with targets encoded
                             calls.append((method_name, i, match.start(2), "func_map", targets))
                         else:
+                            is_callback, _ = is_callback_api(method_name, self.callback_config)
                             calls.append((method_name, i, match.start(2), is_callback))
 
                 # Pass 4: Find pointer member calls obj->method(...)
@@ -526,18 +605,16 @@ class CallGraphBuilder:
                     obj_name = match.group(1)
                     method_name = match.group(2)
                     if method_name not in keywords and obj_name not in keywords:
-                        from .callback_config import is_callback_api
-                        is_callback, _ = is_callback_api(method_name, self.callback_config)
-                        calls.append((method_name, i, match.start(2), is_callback))
+                        found, targets = cfg.is_func_ptr_call(obj_name, method_name)
+                        if found and targets:
+                            calls.append((method_name, i, match.start(2), "func_map", targets))
+                        else:
+                            is_callback, _ = is_callback_api(method_name, self.callback_config)
+                            calls.append((method_name, i, match.start(2), is_callback))
 
                 # Pass 6: Detect ioctl-like calls matching configured format pattern
-                from .callback_config import _get_config
-                cfg = _get_config(self.callback_config)
-                ioctl_re = cfg.parse_ioctl_format()
                 if ioctl_re:
-                    ioctl_commands = cfg.load()["ioctl_map"].get("commands", {})
                     for match in ioctl_re.finditer(line):
-                        # Find which captured group matches a known command
                         for group in match.groups():
                             cmd = group.strip()
                             if cmd in ioctl_commands:
@@ -589,8 +666,12 @@ class CallGraphBuilder:
                 targets = call_info[4]  # list of function names
                 self._log(f"  func_map match: {callee_name} → {targets}")
                 for target_name in targets:
-                    # Search for target definition in project files
-                    actual_def_line = self._fallback_search_definition(target_name)
+                    # Use pre-resolved cache, fallback to search
+                    actual_def_line = self._target_def_cache.get(target_name)
+                    if actual_def_line is None:
+                        actual_def_line = self._fallback_search_definition(target_name)
+                        if actual_def_line is not None:
+                            self._target_def_cache[target_name] = actual_def_line
                     if actual_def_line is not None:
                         t_path, t_line = actual_def_line
                         callee_id = self._register_node(t_path, t_line + 1, target_name)
@@ -610,7 +691,12 @@ class CallGraphBuilder:
             if call_type == "ioctl":
                 handler_name = callee_name  # already the resolved handler
                 self._log(f"  ioctl match: handler={handler_name}")
-                actual_def_line = self._fallback_search_definition(handler_name)
+                # Use pre-resolved cache, fallback to search
+                actual_def_line = self._target_def_cache.get(handler_name)
+                if actual_def_line is None:
+                    actual_def_line = self._fallback_search_definition(handler_name)
+                    if actual_def_line is not None:
+                        self._target_def_cache[handler_name] = actual_def_line
                 if actual_def_line is not None:
                     h_path, h_line = actual_def_line
                     callee_id = self._register_node(h_path, h_line + 1, handler_name)
@@ -954,6 +1040,10 @@ class CallGraphBuilder:
             Root node ID, or None if not found
         """
         self._log(f"Building graph from {file_path}:{line}:{character}")
+
+        # Pre-resolve all indirect targets (ioctl handlers + func_map targets)
+        if not self._target_def_cache:
+            self._pre_resolve_indirect_targets()
 
         # Ensure file is opened first
         abs_path = os.path.abspath(file_path)

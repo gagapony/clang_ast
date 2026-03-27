@@ -64,7 +64,7 @@ class CallbackConfig:
 
         param_in = raw.get("param_in", {})
         func_map = raw.get("func_map", {})
-        func_map_flat = self._flatten_dict(func_map)
+        func_map_nested = self._normalize_func_map(func_map)
 
         ioctl_raw = raw.get("ioctl_map", {})
         ioctl_format = ioctl_raw.get("format", "")
@@ -72,9 +72,70 @@ class CallbackConfig:
 
         return {
             "param_in": {str(k): int(v) for k, v in param_in.items()},
-            "func_map": func_map_flat,
+            "func_map": func_map_nested,
             "ioctl_map": {"format": ioctl_format, "commands": ioctl_commands},
         }
+
+    @staticmethod
+    def _normalize_func_map(func_map: dict) -> dict:
+        """
+        Normalize func_map to flat structure: {expression: {"targets": [...], "search_dir": "..."}}
+        TOML structure:
+            [func_map.genbin]
+            path = "sdk/interface/src/ldc/wrapper/src"
+            "pC->Init" = ["LDC_EPTZ_Init", ...]
+            g_stWrapIntf.stWrapLdc.SetLDCAttr = ["LDC_WRAPPER_LDC_SetChnLDCAttr"]
+        Parsed by tomllib as:
+            {"genbin": {"path": "...", "pC->Init": [...],
+                        "g_stWrapIntf": {"stWrapLdc": {"SetLDCAttr": [...]}}}}
+        We flatten dotted keys and extract search_dir + expression entries.
+        """
+        result = {}
+
+        def _flatten_entries(entries: dict, prefix: str = "") -> dict:
+            """Flatten nested TOML keys (dotted keys become flat with dot separator)."""
+            flat = {}
+            for key, value in entries.items():
+                full_key = f"{prefix}.{key}" if prefix else key
+                if isinstance(value, dict):
+                    flat.update(_flatten_entries(value, full_key))
+                else:
+                    flat[full_key] = value
+            return flat
+
+        def _process_group(group: dict) -> None:
+            """Extract search_dir and expression entries from a func_map group."""
+            search_dir = ""
+            raw_entries = {}
+
+            for k, v in group.items():
+                if k == "path" and isinstance(v, str):
+                    search_dir = v
+                else:
+                    raw_entries[k] = v
+
+            # Flatten dotted keys (e.g., g_stWrapIntf.stWrapLdc.SetLDCAttr)
+            flat_entries = _flatten_entries(raw_entries)
+
+            for expr, targets in flat_entries.items():
+                if isinstance(targets, list):
+                    result[expr] = {
+                        "targets": targets,
+                        "search_dir": search_dir
+                    }
+
+        for key, value in func_map.items():
+            if isinstance(value, dict):
+                if "path" in value:
+                    # This is a func_map group
+                    _process_group(value)
+                else:
+                    # Nested TOML key, check deeper
+                    for k2, v2 in value.items():
+                        if isinstance(v2, dict) and "path" in v2:
+                            _process_group(v2)
+
+        return result
 
     def _load_legacy_cfg(self, path: str) -> dict:
         """Load legacy .cfg format (api_name:param_index per line)."""
@@ -96,17 +157,7 @@ class CallbackConfig:
             print(f"Warning: Failed to load callback config: {e}", file=sys.stderr)
         return {"param_in": param_in, "func_map": {}, "ioctl_map": {"format": ""}}
 
-    @staticmethod
-    def _flatten_dict(d: dict, prefix: str = "") -> dict:
-        """Flatten nested dict to dotted-key dict (handles TOML dotted keys)."""
-        items = {}
-        for k, v in d.items():
-            key = f"{prefix}.{k}" if prefix else str(k)
-            if isinstance(v, dict):
-                items.update(CallbackConfig._flatten_dict(v, key))
-            else:
-                items[key] = v
-        return items
+
 
     # ── param_in API ──
     def is_callback_api(self, function_name: str) -> Tuple[bool, int]:
@@ -120,25 +171,50 @@ class CallbackConfig:
         return False, -1
 
     # ── func_map API ──
-    def resolve_func_ptr(self, dotted_path: str) -> List[str]:
+    def resolve_func_ptr(self, expression: str) -> List[str]:
+        """
+        Resolve a function pointer call expression to concrete targets.
+        """
         func_map = self.load()["func_map"]
-        if dotted_path in func_map:
-            targets = func_map[dotted_path]
-            return targets if isinstance(targets, list) else [targets]
+        if expression in func_map:
+            return func_map[expression].get("targets", [])
         return []
 
-    def is_func_ptr_call(self, obj: str, field: str) -> Tuple[bool, List[str]]:
+    def get_func_ptr_search_dir(self, expression: str) -> str:
+        """
+        Get the search directory hint for a function pointer expression.
+        """
         func_map = self.load()["func_map"]
-        for path, targets in func_map.items():
-            parts = path.split(".")
-            if len(parts) >= 2:
-                if parts[-1] == field and ".".join(parts[:-1]).endswith(obj):
-                    t = targets if isinstance(targets, list) else [targets]
-                    return True, t
-                if path == f"{obj}.{field}":
-                    t = targets if isinstance(targets, list) else [targets]
-                    return True, t
+        if expression in func_map:
+            return func_map[expression].get("search_dir", "")
+        return ""
+
+    def match_func_ptr_call(self, expression: str) -> Tuple[bool, List[str]]:
+        """
+        Match a function pointer call expression against func_map.
+        Returns (found, targets).
+        """
+        func_map = self.load()["func_map"]
+        if expression in func_map:
+            return True, func_map[expression].get("targets", [])
         return False, []
+
+    def is_func_ptr_call(self, obj: str, field: str) -> Tuple[bool, List[str]]:
+        """
+        Check if obj->field or obj.field is a known function pointer call.
+        """
+        expr_arrow = f"{obj}->{field}"
+        expr_dot = f"{obj}.{field}"
+        found, targets = self.match_func_ptr_call(expr_arrow)
+        if found:
+            return True, targets
+        return self.match_func_ptr_call(expr_dot)
+
+    def get_all_func_ptr_entries(self) -> dict:
+        """
+        Get all func_map entries as {expression: {"targets": [...], "search_dir": "..."}}.
+        """
+        return self.load()["func_map"]
 
     # ── ioctl_map API ──
     def get_ioctl_format(self) -> str:
@@ -181,8 +257,8 @@ def get_callback_apis(config_path: Optional[str] = None) -> Dict[str, int]:
 def get_all_callback_apis(config_path: Optional[str] = None) -> List[str]:
     return list(_get_config(config_path).load()["param_in"].keys())
 
-def resolve_func_ptr(dotted_path: str, config_path: Optional[str] = None) -> List[str]:
-    return _get_config(config_path).resolve_func_ptr(dotted_path)
+def resolve_func_ptr(expression: str, config_path: Optional[str] = None) -> List[str]:
+    return _get_config(config_path).resolve_func_ptr(expression)
 
 def resolve_ioctl(command: str, config_path: Optional[str] = None) -> Optional[str]:
     return _get_config(config_path).resolve_ioctl(command)
