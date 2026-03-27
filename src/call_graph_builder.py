@@ -80,12 +80,35 @@ class CallGraphBuilder:
         # Maps target_name -> (file_path, line_0)
         self._target_def_cache: Dict[str, Tuple[str, int]] = {}
 
+        # File content cache: file_path -> file content string
+        self._file_cache: Dict[str, str] = {}
+
         self._log(f"CallGraphBuilder initialized, filter_rules={len(self.filter_config.rules)}")
 
     def _log(self, message: str) -> None:
         """Log message if verbose mode is enabled."""
         if self.verbose:
             print(f"[CallGraphBuilder] {message}")
+
+    def _read_file(self, file_path: str) -> Optional[str]:
+        """Read file content with caching. Returns full text or None on error."""
+        abs_path = os.path.abspath(file_path)
+        if abs_path in self._file_cache:
+            return self._file_cache[abs_path]
+        try:
+            with open(abs_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self._file_cache[abs_path] = content
+            return content
+        except Exception:
+            return None
+
+    def _read_lines(self, file_path: str) -> List[str]:
+        """Read file lines with caching. Returns list of lines or empty list."""
+        content = self._read_file(file_path)
+        if content is None:
+            return []
+        return content.splitlines(True)
 
     def _pre_resolve_indirect_targets(self) -> None:
         """
@@ -185,9 +208,10 @@ class CallGraphBuilder:
             Line number of definition (0-based), or None if not found
         """
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                content = f.read()
-                lines = content.splitlines(True)
+            content = self._read_file(file_path)
+            if content is None:
+                return None
+            lines = content.splitlines(True)
 
             # Build search patterns based on whether function_name is qualified
             patterns = []
@@ -238,10 +262,8 @@ class CallGraphBuilder:
                 self.client.open_document(file_path)
                 self.opened_files.add(file_path)
                 self._log(f"Opened: {file_path}")
-                # Dynamic delay like reference code: increases with more files
-                import time
-                delay = max(0.5, len(self.opened_files) * 0.05)
-                time.sleep(delay)
+                # import time
+                # time.sleep(0.1)
             except Exception as e:
                 self._log(f"Failed to open {file_path}: {e}")
 
@@ -252,16 +274,12 @@ class CallGraphBuilder:
         char: int
     ) -> str:
         """Get word at position in file."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-                if line < len(lines):
-                    text_line = lines[line]
-                    for match in re.finditer(r'[a-zA-Z_]\w*', text_line):
-                        if match.start() <= char <= match.end():
-                            return match.group(0)
-        except Exception:
-            pass
+        lines = self._read_lines(file_path)
+        if line < len(lines):
+            text_line = lines[line]
+            for match in re.finditer(r'[a-zA-Z_]\w*', text_line):
+                if match.start() <= char <= match.end():
+                    return match.group(0)
         return "UnknownFunction"
 
     def _get_function_range(
@@ -270,29 +288,27 @@ class CallGraphBuilder:
         start_line_0: int
     ) -> Tuple[int, int]:
         """Get function range by brace matching."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            brace_count = 0
-            found_first_brace = False
-            end_line = start_line_0
-
-            for i in range(start_line_0, len(lines)):
-                clean_line = re.sub(r'//.*', '', lines[i])
-                brace_count += clean_line.count('{')
-                brace_count -= clean_line.count('}')
-
-                if found_first_brace and brace_count <= 0:
-                    end_line = i
-                    break
-
-                if '{' in clean_line:
-                    found_first_brace = True
-
-            return (start_line_0 + 1, end_line + 1)
-        except Exception:
+        lines = self._read_lines(file_path)
+        if not lines:
             return (start_line_0 + 1, start_line_0 + 1)
+
+        brace_count = 0
+        found_first_brace = False
+        end_line = start_line_0
+
+        for i in range(start_line_0, len(lines)):
+            clean_line = re.sub(r'//.*', '', lines[i])
+            brace_count += clean_line.count('{')
+            brace_count -= clean_line.count('}')
+
+            if found_first_brace and brace_count <= 0:
+                end_line = i
+                break
+
+            if '{' in clean_line:
+                found_first_brace = True
+
+        return (start_line_0 + 1, end_line + 1)
 
     def _get_enclosing_function(
         self,
@@ -300,26 +316,24 @@ class CallGraphBuilder:
         target_line_0: int
     ) -> Tuple[str, int]:
         """Get enclosing function name and line."""
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+        lines = self._read_lines(file_path)
+        if not lines:
+            return "UnknownContext", target_line_0
 
-            brace_count = 0
-            for i in range(min(target_line_0, len(lines) - 1), -1, -1):
-                clean_line = re.sub(r'//.*|/\*.*\*/', '', lines[i])
-                brace_count += clean_line.count('}')
-                brace_count -= clean_line.count('{')
+        brace_count = 0
+        for i in range(min(target_line_0, len(lines) - 1), -1, -1):
+            clean_line = re.sub(r'//.*|/\*.*\*/', '', lines[i])
+            brace_count += clean_line.count('}')
+            brace_count -= clean_line.count('{')
 
-                if brace_count < 0:
-                    for j in range(i, max(-1, i - 6), -1):
-                        m = re.search(r'\b([a-zA-Z_]\w*)\s*\(', lines[j])
-                        if m:
-                            name = m.group(1)
-                            if name not in {'if', 'for', 'while', 'switch', 'catch', 'else'}:
-                                return name, j
-                    brace_count = 0
-        except Exception:
-            pass
+            if brace_count < 0:
+                for j in range(i, max(-1, i - 6), -1):
+                    m = re.search(r'\b([a-zA-Z_]\w*)\s*\(', lines[j])
+                    if m:
+                        name = m.group(1)
+                        if name not in {'if', 'for', 'while', 'switch', 'catch', 'else'}:
+                            return name, j
+                brace_count = 0
         return "UnknownContext", target_line_0
 
     def _get_function_metadata(
@@ -332,25 +346,23 @@ class CallGraphBuilder:
         qualified_name = default_name
         brief = ""
 
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+        lines = self._read_lines(file_path)
+        if not lines:
+            return qualified_name, brief
 
-            idx = line_start_1 - 1
-            if 0 <= idx < len(lines):
-                # Try to find Class::Method pattern
-                match = re.search(r'\b([a-zA-Z_]\w*::[a-zA-Z_]\w*)\b', lines[idx])
-                if match:
-                    qualified_name = match.group(1)
+        idx = line_start_1 - 1
+        if 0 <= idx < len(lines):
+            # Try to find Class::Method pattern
+            match = re.search(r'\b([a-zA-Z_]\w*::[a-zA-Z_]\w*)\b', lines[idx])
+            if match:
+                qualified_name = match.group(1)
 
-                # Look for brief comment above function definition
-                brief = self._extract_brief_comment(lines, idx)
+            # Look for brief comment above function definition
+            brief = self._extract_brief_comment(lines, idx)
 
-                # Reject brief that's just the function name (redundant)
-                if brief and brief.lower() == default_name.lower():
-                    brief = ""
-        except Exception:
-            pass
+            # Reject brief that's just the function name (redundant)
+            if brief and brief.lower() == default_name.lower():
+                brief = ""
 
         return qualified_name, brief
 
@@ -555,9 +567,11 @@ class CallGraphBuilder:
         keywords = {'if', 'while', 'for', 'switch', 'sizeof', 'return',
                     'catch', '__attribute__', 'new', 'delete'}
 
+        lines = self._read_lines(file_path)
+        if not lines:
+            return calls
+
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
 
             # Load config once before the loop (not every line)
             from .callback_config import is_callback_api, _get_config
@@ -885,13 +899,14 @@ class CallGraphBuilder:
         Returns:
             List of (callback_name, line, char) tuples
         """
+        lines = self._read_lines(file_path)
+        if not lines:
+            return []
+
+        if line_0 >= len(lines):
+            return []
+
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            if line_0 >= len(lines):
-                return []
-
             # Get callback parameter position for this API (from config)
             from .callback_config import is_callback_api
             is_callback, param_idx = is_callback_api(api_name, self.callback_config)
@@ -1024,15 +1039,11 @@ class CallGraphBuilder:
             if self._is_in_scope(caller_path):
                 # Find character position of caller name
                 char_idx = 0
-                try:
-                    with open(caller_path, 'r', encoding='utf-8') as f:
-                        lines = f.readlines()
-                        if caller_sig_line < len(lines):
-                            match = re.search(r'\b' + re.escape(caller_name) + r'\b', lines[caller_sig_line])
-                            if match:
-                                char_idx = match.start()
-                except Exception:
-                    pass
+                lines = self._read_lines(caller_path)
+                if caller_sig_line < len(lines):
+                    match = re.search(r'\b' + re.escape(caller_name) + r'\b', lines[caller_sig_line])
+                    if match:
+                        char_idx = match.start()
 
                 self._ensure_file_opened(caller_path)
                 self._build_incoming(
@@ -1274,19 +1285,17 @@ class CallGraphBuilder:
         Returns:
             Actual definition line number (0-based)
         """
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+        lines = self._read_lines(file_path)
+        if not lines:
+            return start_line_0
 
-            # Search backwards from start_line_0 (up to 10 lines)
-            search_limit = max(0, start_line_0 - 10)
-            for line_num in range(start_line_0, search_limit - 1, -1):
-                line = lines[line_num] if line_num < len(lines) else ""
-                if function_name in line:
-                    # Found it
-                    return line_num
-        except Exception as e:
-            self._log(f"Error finding definition line: {e}")
+        # Search backwards from start_line_0 (up to 10 lines)
+        search_limit = max(0, start_line_0 - 10)
+        for line_num in range(start_line_0, search_limit - 1, -1):
+            line = lines[line_num] if line_num < len(lines) else ""
+            if function_name in line:
+                # Found it
+                return line_num
 
         # Fallback to original line
         return start_line_0
@@ -1308,17 +1317,12 @@ class CallGraphBuilder:
         Returns:
             Character position (0-based)
         """
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
-
-            if line_0 < len(lines):
-                line = lines[line_0]
-                match = re.search(r'\b' + re.escape(function_name) + r'\b', line)
-                if match:
-                    return match.start()
-        except Exception as e:
-            self._log(f"Error finding function name position: {e}")
+        lines = self._read_lines(file_path)
+        if line_0 < len(lines):
+            line = lines[line_0]
+            match = re.search(r'\b' + re.escape(function_name) + r'\b', line)
+            if match:
+                return match.start()
 
         # Fallback
         return 0
