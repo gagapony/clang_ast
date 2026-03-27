@@ -68,12 +68,13 @@ class CallbackConfig:
 
         ioctl_raw = raw.get("ioctl_map", {})
         ioctl_format = ioctl_raw.get("format", "")
-        ioctl_commands = {k: v for k, v in ioctl_raw.items() if k != "format"}
+        ioctl_path = ioctl_raw.get("path", "")
+        ioctl_commands = {k: v for k, v in ioctl_raw.items() if k not in ("format", "path")}
 
         return {
             "param_in": {str(k): int(v) for k, v in param_in.items()},
             "func_map": func_map_nested,
-            "ioctl_map": {"format": ioctl_format, "commands": ioctl_commands},
+            "ioctl_map": {"format": ioctl_format, "path": ioctl_path, "commands": ioctl_commands},
         }
 
     @staticmethod

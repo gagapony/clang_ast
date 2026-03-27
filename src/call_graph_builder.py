@@ -102,11 +102,13 @@ class CallGraphBuilder:
         # target_name -> search_dir (empty string = full project fallback)
         target_dirs: Dict[str, str] = {}
 
-        # ioctl handlers (no dir hint, search full project)
-        ioctl_commands = data.get("ioctl_map", {}).get("commands", {})
+        # ioctl handlers (use path hint from config, non-recursive)
+        ioctl_data = data.get("ioctl_map", {})
+        ioctl_path = ioctl_data.get("path", "")
+        ioctl_commands = ioctl_data.get("commands", {})
         for handler in ioctl_commands.values():
             if handler not in target_dirs:
-                target_dirs[handler] = ""
+                target_dirs[handler] = ioctl_path
 
         # func_map targets (use search_dir from config)
         func_map = data.get("func_map", {})
@@ -611,6 +613,23 @@ class CallGraphBuilder:
                         else:
                             is_callback, _ = is_callback_api(method_name, self.callback_config)
                             calls.append((method_name, i, match.start(2), is_callback))
+
+                # Pass 5: Find function pointer args (obj.method NOT followed by ()
+                # e.g., LDC_CHECK_FEATURE(g_stWrapIntf.stWrapLdc.SetLDCAttr, ...)
+                # Direct calls (obj.method(...)) are already caught by Pass 3.
+                # Here we match func_map keys appearing without trailing '('.
+                func_map_entries = cfg.get_all_func_ptr_entries()
+                for expr, info in func_map_entries.items():
+                    idx = line.find(expr)
+                    while idx != -1:
+                        after_idx = idx + len(expr)
+                        # Skip if followed by ( (direct call, handled by Pass 3/4)
+                        rest = line[after_idx:].lstrip()
+                        if not rest.startswith('('):
+                            targets = info.get("targets", [])
+                            if targets:
+                                calls.append((expr, i, idx, "func_map", targets))
+                        idx = line.find(expr, after_idx)
 
                 # Pass 6: Detect ioctl-like calls matching configured format pattern
                 if ioctl_re:

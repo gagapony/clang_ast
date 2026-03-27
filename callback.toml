@@ -2,10 +2,11 @@
 #
 # This file defines how to resolve indirect calls that clangd cannot resolve:
 #   1. [param_in]  - Callback API parameter mapping
-#   2. [func_map]  - Function pointer struct field → implementations
+#   2. [func_map]  - Function pointer struct → implementations
 #   3. [ioctl_map] - ioctl-like command → handler function
 #
 # All paths are relative to the project root (-p).
+# Copy this file to your project and customize for your codebase.
 
 # ──────────────────────────────────────────────
 # Section 1: Callback API parameter index
@@ -15,13 +16,13 @@
 #
 # Example: xTaskCreate(taskFunc, ...) → parameter 0 is the callback
 
-# FreeRTOS APIs
 [param_in]
+# FreeRTOS
 xTaskCreate = 0
 xTaskCreateStatic = 0
 xTaskCreatePinnedToCore = 0
 
-# POSIX APIs
+# POSIX
 pthread_create = 1
 atexit = 0
 signal = 1
@@ -30,73 +31,74 @@ signal = 1
 "std::thread::thread" = 0
 "std::async" = 0
 
-# Arduino / ESP32
-attachInterrupt = 0
-setTimeout = 0
-setInterval = 0
-
 # Common patterns
 registerCallback = 0
 setCallback = 0
 addEventListener = 1
 addListener = 1
-on = 1
-once = 1
-off = 1
-
-# Event handling patterns
-emit = 1
 
 # ──────────────────────────────────────────────
-# Section 2: Function pointer → implementations
+# Section 2: Function pointer struct → implementations
 # ──────────────────────────────────────────────
-# Structure: func_map → group → {path, expression → targets}
+# Structure: [func_map.<group>]
+#   path      = "<dir>"                    # search directory for targets (non-recursive)
+#   "expr"    = ["TargetA", "TargetB"]     # function pointer call → concrete implementations
 #
-# path: directory to search for target function definitions (non-recursive)
-# expression: full expression as it appears in code (pC->FreeBins, obj.Method)
-# targets: list of actual function names
+# 'expr' can use dot (obj.Method) or arrow (pObj->Method) syntax.
+# If expr contains dots (e.g., g_intf.driver.init), quote it as a string key.
+# Multiple groups can have different search paths.
 #
-# Multiple groups can share or differ in search paths.
+# Example code:
+#   g_driver.ops->init(pdev);        // direct call
+#   REGISTER(g_driver.ops->init);    // passed as arg (also detected)
+#
+# The tool resolves both cases to all listed targets.
 
 [func_map]
 
-[func_map.ldc_wrapper]
-path = "sdk/interface/src/ldc/wrapper"
-g_stWrapIntf.stWrapLdc.SetLDCAttr = ["LDC_WRAPPER_LDC_SetChnLDCAttr"]
+# ── Example: driver ops struct ──
+# Code: g_stDriver.ops->Init(pdev, &cfg);
+#       CALL(g_stDriver.ops->Init, pdev, &cfg);
+#
+# [func_map.driver_ops]
+# path = "src/drivers"
+# g_stDriver.ops->Init = ["DriverA_Init", "DriverB_Init"]
+# g_stDriver.ops->DeInit = ["DriverA_DeInit", "DriverB_DeInit"]
+# g_stDriver.ops->Start = ["DriverA_Start", "DriverB_Start"]
 
-[func_map.genbin]
-path = "sdk/interface/src/ldc/wrapper/src"
-"pC->Init" = ["LDC_EPTZ_Init", "LDC_CVLIB_Init", "LDC_EIS_EPTZ_Init"]
-"pC->DeInit" = ["LDC_EPTZ_DeInit", "LDC_CVLIB_DeInit", "LDC_EIS_EPTZ_DeInit"]
-"pC->UpdateCfg" = ["LDC_EPTZ_UpdateCfg", "LDC_CVLIB_UpdateCfg", "LDC_EIS_EPTZ_UpdateCfg"]
-"pC->GenBins" = ["LDC_EPTZ_GenBins", "LDC_CVLIB_GenBins", "LDC_EIS_EPTZ_GenBins"]
-"pC->FreeBins" = ["LDC_EPTZ_FreeBins", "LDC_CVLIB_FreeBins", "LDC_EIS_EPTZ_FreeBins"]
-"pC->MapBorderInit" = ["LDC_EPTZ_MapBorderInit"]
-"pC->MapBorderDeInit" = ["LDC_EPTZ_MapBorderDeInit"]
-"pC->MapBorderGetSize" = ["LDC_EPTZ_GetMapBorderSize"]
-"pC->MapBorderGetData" = ["LDC_EPTZ_GenMapBorderData"]
-"pC->QueryMapPoints" = ["LDC_EPTZ_QueryMapPoints", "LDC_CVLIB_QueryMapPoints"]
-"pC->GetDispMapSize" = ["LDC_CVLIB_GetDispMapSize"]
-"pC->GetDispMapInfo" = ["LDC_CVLIB_GetDispMapInfo"]
-"pC->QueryMapPoint" = ["LDC_CVLIB_QueryMapPoint"]
-"pC->CalcMotion" = ["LDC_CVLIB_MotionMapCalc"]
-"pC->GetBoundaryParam" = ["LDC_EIS_EPTZ_GetBoundaryParam"]
+# ── Example: callback struct with function pointers ──
+# Code: pHandler->Process(buf, len);
+#
+# [func_map.callback]
+# path = "src/handlers"
+# "pHandler->Process" = ["HandlerA_Process", "HandlerB_Process"]
+# "pHandler->Reset" = ["HandlerA_Reset", "HandlerB_Reset"]
+
+# ── Example: vtable / interface pattern ──
+# Code: pVtbl->Write(data, size);
+#
+# [func_map.vtable]
+# path = "src/io"
+# "pVtbl->Write" = ["Uart_Write", "Spi_Write", "I2c_Write"]
+# "pVtbl->Read" = ["Uart_Read", "Spi_Read", "I2c_Read"]
 
 # ──────────────────────────────────────────────
 # Section 3: ioctl-like command → handler
 # ──────────────────────────────────────────────
-# When code calls an ioctl wrapper function, resolve the command
-# to its actual handler function.
+# Resolves ioctl wrapper calls to their actual handler functions.
 #
-# 'format': the call pattern where * is a wildcard
+# 'format': call pattern where * is a wildcard
+# 'path':   directory to search for handler definitions (non-recursive)
 # Other keys: command_constant → handler_function
 #
 # Example code:
-#   MI_SYSCALL_SOCID(0, LDC_IOC_SET_ATTR, &param)
-# Matches format pattern, extracts LDC_IOC_SET_ATTR,
-# resolves to MI_LDC_SetChnLDCAttr.
+#   MI_SYSCALL_SOCID(0, CMD_SET_ATTR, &param)
+# Matches format pattern, extracts CMD_SET_ATTR,
+# resolves to Handler_SetAttr.
 #
 # [ioctl_map]
 # format = "MI_SYSCALL_SOCID(*,*,*)"
-# LDC_IOC_SET_ATTR = "MI_LDC_SetChnLDCAttr"
-# LDC_IOC_GET_STATUS = "MI_LDC_GetChnLDCAttr"
+# path = "src/ioctl"
+# CMD_SET_ATTR = "Handler_SetAttr"
+# CMD_GET_STATUS = "Handler_GetStatus"
+# CMD_RESET = "Handler_Reset"
