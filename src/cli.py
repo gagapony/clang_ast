@@ -98,7 +98,7 @@ Examples:
         '--callback-config',
         type=str,
         default=None,
-        help='Callback API configuration file (default: callback.cfg in tool directory)'
+        help='Callback API configuration file (default: callback.toml in tool directory)'
     )
 
     parser.add_argument(

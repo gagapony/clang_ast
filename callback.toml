@@ -18,24 +18,24 @@
 
 [param_in]
 # FreeRTOS
-xTaskCreate = 0
-xTaskCreateStatic = 0
-xTaskCreatePinnedToCore = 0
+xTaskCreate = [0]
+xTaskCreateStatic = [0]
+xTaskCreatePinnedToCore = [0]
 
 # POSIX
-pthread_create = 1
-atexit = 0
-signal = 1
+pthread_create = [1]
+atexit = [0]
+signal = [1]
 
 # C++ Threading
-"std::thread::thread" = 0
-"std::async" = 0
+"std::thread::thread" = [0]
+"std::async" = [0]
 
 # Common patterns
-registerCallback = 0
-setCallback = 0
-addEventListener = 1
-addListener = 1
+registerCallback = [0]
+setCallback = [0]
+addEventListener = [1]
+addListener = [1]
 
 # ──────────────────────────────────────────────
 # Section 2: Function pointer struct → implementations

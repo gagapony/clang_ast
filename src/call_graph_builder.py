@@ -604,48 +604,44 @@ class CallGraphBuilder:
                         is_callback, _ = is_callback_api(func_name, self.callback_config)
                         calls.append((func_name, i, match.start(1), is_callback))
 
-                # Pass 3: Find member calls obj.method(...), extract method name
-                for match in re.finditer(r'(?<!::)\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\s*\(', line):
-                    obj_name = match.group(1)
-                    method_name = match.group(2)
-                    if method_name not in keywords and obj_name not in keywords:
-                        found, targets = cfg.is_func_ptr_call(obj_name, method_name)
-                        if found and targets:
-                            calls.append((method_name, i, match.start(2), "func_map", targets))
-                        else:
-                            is_callback, _ = is_callback_api(method_name, self.callback_config)
-                            calls.append((method_name, i, match.start(2), is_callback))
-
-                # Pass 4: Find pointer member calls obj->method(...)
-                for match in re.finditer(r'\b([a-zA-Z_]\w*)->([a-zA-Z_]\w*)\s*\(', line):
-                    obj_name = match.group(1)
-                    method_name = match.group(2)
-                    if method_name not in keywords and obj_name not in keywords:
-                        found, targets = cfg.is_func_ptr_call(obj_name, method_name)
-                        if found and targets:
-                            calls.append((method_name, i, match.start(2), "func_map", targets))
-                        else:
-                            is_callback, _ = is_callback_api(method_name, self.callback_config)
-                            calls.append((method_name, i, match.start(2), is_callback))
-
-                # Pass 5: Find function pointer args (obj.method NOT followed by ()
-                # e.g., LDC_CHECK_FEATURE(g_stWrapIntf.stWrapLdc.SetLDCAttr, ...)
-                # Direct calls (obj.method(...)) are already caught by Pass 3.
-                # Here we match func_map keys appearing without trailing '('.
+                # Pass 3: func_map 统一匹配 — 覆盖所有出现形式
+                # obj.field(...), obj->field(...), MACRO(obj.field, ...) 等
                 func_map_entries = cfg.get_all_func_ptr_entries()
+                func_expr_set = set(func_map_entries.keys())
                 for expr, info in func_map_entries.items():
                     idx = line.find(expr)
                     while idx != -1:
                         after_idx = idx + len(expr)
-                        # Skip if followed by ( (direct call, handled by Pass 3/4)
                         rest = line[after_idx:].lstrip()
-                        if not rest.startswith('('):
-                            targets = info.get("targets", [])
-                            if targets:
-                                calls.append((expr, i, idx, "func_map", targets))
+                        # 跳过 expr 是更长标识符前缀的情况 (如 expr=Init 匹配到 Initialize)
+                        if rest and (rest[0].isalnum() or rest[0] == '_'):
+                            idx = line.find(expr, after_idx)
+                            continue
+                        targets = info.get("targets", [])
+                        if targets:
+                            calls.append((expr, i, idx, "func_map", targets))
                         idx = line.find(expr, after_idx)
 
-                # Pass 6: Detect ioctl-like calls matching configured format pattern
+                # Pass 4: 非 func_map 的普通成员调用 obj.field( / obj->method(
+                for match in re.finditer(r'(?<!::)\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\s*\(', line):
+                    obj_name = match.group(1)
+                    method_name = match.group(2)
+                    if method_name not in keywords and obj_name not in keywords:
+                        if f"{obj_name}.{method_name}" in func_expr_set:
+                            continue
+                        is_callback, _ = is_callback_api(method_name, self.callback_config)
+                        calls.append((method_name, i, match.start(2), is_callback))
+
+                for match in re.finditer(r'\b([a-zA-Z_]\w*)->([a-zA-Z_]\w*)\s*\(', line):
+                    obj_name = match.group(1)
+                    method_name = match.group(2)
+                    if method_name not in keywords and obj_name not in keywords:
+                        if f"{obj_name}->{method_name}" in func_expr_set:
+                            continue
+                        is_callback, _ = is_callback_api(method_name, self.callback_config)
+                        calls.append((method_name, i, match.start(2), is_callback))
+
+                # Pass 5: ioctl 命令映射
                 if ioctl_re:
                     for match in ioctl_re.finditer(line):
                         for group in match.groups():
@@ -660,6 +656,76 @@ class CallGraphBuilder:
             self._log(f"Error finding calls: {e}")
 
         return calls
+
+    def _register_and_recurse(
+        self,
+        caller_id: int,
+        callee_name: str,
+        callee_path: str,
+        callee_line_0: int,
+        current_depth: int
+    ) -> int:
+        """Register callee node, add edge, return callee_id."""
+        callee_id = self._register_node(callee_path, callee_line_0 + 1, callee_name)
+        edge_key = (caller_id, callee_id)
+        if edge_key not in self.processed_outgoing:
+            self.processed_outgoing.add(edge_key)
+            self._add_edge(caller_id, callee_id)
+        return callee_id
+
+    def _resolve_callback_edges(
+        self,
+        caller_id: int,
+        callee_name: str,
+        callee_path: str,
+        callee_line_0: int,
+        caller_path: str,
+        current_depth: int
+    ) -> None:
+        """
+        Check if callee is a callback API (param_in). If so, resolve all
+        callback parameters as edges and recurse into each callback function.
+        """
+        from .callback_config import is_callback_api
+
+        is_cb_api, param_indices = is_callback_api(callee_name, self.callback_config)
+        if not is_cb_api:
+            return
+
+        self._log(f"  Resolving param_in callbacks {param_indices} for '{callee_name}'")
+        callback_results = self._resolve_callback_parameter(
+            caller_path, callee_line_0, callee_name
+        )
+
+        for cb_name, cb_line, cb_char in callback_results:
+            try:
+                result = self.client.textDocument_definition(
+                    self.client._path_to_uri(caller_path),
+                    line=cb_line,
+                    character=cb_char
+                )
+            except Exception as e:
+                self._log(f"  Error resolving callback {cb_name}: {e}")
+                continue
+
+            if not result:
+                continue
+
+            target_uri = result.get("uri") or result.get("targetUri")
+            if not target_uri:
+                continue
+
+            range_info = result.get("range") or result.get("targetRange", {})
+            start_line_0 = range_info.get("start", {}).get("line", 0)
+            cb_path = self.client._uri_to_path(target_uri)
+
+            cb_id = self._register_and_recurse(caller_id, cb_name, cb_path, start_line_0, current_depth)
+
+            if self._is_in_scope(cb_path):
+                self._ensure_file_opened(cb_path)
+                self._build_outgoing(target_uri, cb_name, start_line_0, cb_id, current_depth + 1)
+            else:
+                self._log(f"  External callback: {cb_name} @ {cb_path}")
 
     def _build_outgoing(
         self,
@@ -694,192 +760,151 @@ class CallGraphBuilder:
             char_idx = call_info[2]
             call_type = call_info[3]
 
-            # ── func_map: direct resolution to mapped targets ──
+            # ══════════════════════════════════════════════════
+            # Step 1: Resolve callee definition (path + line_0)
+            # ══════════════════════════════════════════════════
+            callee_path = None
+            callee_line_0 = None
+            callee_uri = None
+
             if call_type == "func_map":
-                targets = call_info[4]  # list of function names
+                # ── func_map: resolve via pre-cached target lookup ──
+                targets = call_info[4]
                 self._log(f"  func_map match: {callee_name} → {targets}")
                 for target_name in targets:
-                    # Use pre-resolved cache, fallback to search
-                    actual_def_line = self._target_def_cache.get(target_name)
-                    if actual_def_line is None:
-                        actual_def_line = self._fallback_search_definition(target_name)
-                        if actual_def_line is not None:
-                            self._target_def_cache[target_name] = actual_def_line
-                    if actual_def_line is not None:
-                        t_path, t_line = actual_def_line
-                        callee_id = self._register_node(t_path, t_line + 1, target_name)
-                        edge_key = (caller_id, callee_id)
-                        if edge_key not in self.processed_outgoing:
-                            self.processed_outgoing.add(edge_key)
-                            self._add_edge(caller_id, callee_id)
-                            if self._is_in_scope(t_path):
-                                t_uri = self.client._path_to_uri(t_path)
-                                self._ensure_file_opened(t_path)
-                                self._build_outgoing(t_uri, target_name, t_line, callee_id, current_depth + 1)
-                            else:
-                                self._log(f"  External func_map target: {target_name} @ {t_path}")
+                    actual = self._target_def_cache.get(target_name)
+                    if actual is None:
+                        actual = self._fallback_search_definition(target_name)
+                        if actual is not None:
+                            self._target_def_cache[target_name] = actual
+                    if actual is not None:
+                        t_path, t_line = actual
+                        callee_id = self._register_and_recurse(
+                            caller_id, target_name, t_path, t_line, current_depth
+                        )
+                        # Resolve param_in callbacks for this func_map target
+                        self._resolve_callback_edges(
+                            callee_id, target_name, t_path, t_line,
+                            caller_path, current_depth
+                        )
+                        # Recurse into function body
+                        if self._is_in_scope(t_path):
+                            t_uri = self.client._path_to_uri(t_path)
+                            self._ensure_file_opened(t_path)
+                            self._build_outgoing(t_uri, target_name, t_line, callee_id, current_depth + 1)
+                        else:
+                            self._log(f"  External func_map target: {target_name} @ {t_path}")
                 continue
 
-            # ── ioctl: handler resolved during call detection ──
-            if call_type == "ioctl":
-                handler_name = callee_name  # already the resolved handler
+            elif call_type == "ioctl":
+                # ── ioctl: handler already resolved during call detection ──
+                handler_name = callee_name
                 self._log(f"  ioctl match: handler={handler_name}")
-                # Use pre-resolved cache, fallback to search
-                actual_def_line = self._target_def_cache.get(handler_name)
-                if actual_def_line is None:
-                    actual_def_line = self._fallback_search_definition(handler_name)
-                    if actual_def_line is not None:
-                        self._target_def_cache[handler_name] = actual_def_line
-                if actual_def_line is not None:
-                    h_path, h_line = actual_def_line
-                    callee_id = self._register_node(h_path, h_line + 1, handler_name)
-                    edge_key = (caller_id, callee_id)
-                    if edge_key not in self.processed_outgoing:
-                        self.processed_outgoing.add(edge_key)
-                        self._add_edge(caller_id, callee_id)
-                        if self._is_in_scope(h_path):
-                            h_uri = self.client._path_to_uri(h_path)
-                            self._ensure_file_opened(h_path)
-                            self._build_outgoing(h_uri, handler_name, h_line, callee_id, current_depth + 1)
+                actual = self._target_def_cache.get(handler_name)
+                if actual is None:
+                    actual = self._fallback_search_definition(handler_name)
+                    if actual is not None:
+                        self._target_def_cache[handler_name] = actual
+                if actual is not None:
+                    h_path, h_line = actual
+                    callee_id = self._register_and_recurse(
+                        caller_id, handler_name, h_path, h_line, current_depth
+                    )
+                    self._resolve_callback_edges(
+                        callee_id, handler_name, h_path, h_line,
+                        caller_path, current_depth
+                    )
+                    if self._is_in_scope(h_path):
+                        h_uri = self.client._path_to_uri(h_path)
+                        self._ensure_file_opened(h_path)
+                        self._build_outgoing(h_uri, handler_name, h_line, callee_id, current_depth + 1)
                 continue
 
-            is_callback_api = call_type  # boolean for normal calls
-
-            # Special handling for callback APIs
-            if is_callback_api:
-                # Try to resolve callback function (indirect call)
-                # Skip the callback API itself, only add the callback function
-                callback_results = self._resolve_callback_parameter(
-                    caller_path, line_idx, callee_name
+            elif call_type is True:
+                # ── callback API (param_in only, no func_map): skip body, only resolve callbacks ──
+                self._resolve_callback_edges(
+                    caller_id, callee_name, caller_path, line_idx,
+                    caller_path, current_depth
                 )
-
-                if callback_results:
-                    for cb_name, cb_line, cb_char in callback_results:
-                        # Resolve callback function definition
-                        try:
-                            result = self.client.textDocument_definition(
-                                caller_uri,
-                                line=cb_line,
-                                character=cb_char
-                            )
-                        except Exception as e:
-                            self._log(f"Error resolving callback {cb_name}: {e}")
-                            continue
-
-                        if result:
-                            target_uri = result.get("uri") or result.get("targetUri")
-                            if target_uri:
-                                range_info = result.get("range") or result.get("targetRange", {})
-                                start_line_0 = range_info.get("start", {}).get("line", 0)
-
-                                cb_path = self.client._uri_to_path(target_uri)
-
-                                cb_id = self._register_node(cb_path, start_line_0 + 1, cb_name)
-
-                                edge_key = (caller_id, cb_id)
-                                if edge_key not in self.processed_outgoing:
-                                    self.processed_outgoing.add(edge_key)
-                                    self._add_edge(caller_id, cb_id)
-
-                                    if self._is_in_scope(cb_path):
-                                        self._ensure_file_opened(cb_path)
-                                        self._build_outgoing(target_uri, cb_name, start_line_0, cb_id, current_depth + 1)
-                                    else:
-                                        self._log(f"  External callback: {cb_name} @ {cb_path}")
-
-                continue  # Skip normal processing for callback APIs
-
-            # Resolve call target using definition
-            try:
-                result = self.client.textDocument_definition(
-                    caller_uri,
-                    line=line_idx,
-                    character=char_idx
-                )
-            except Exception as e:
-                self._log(f"Error resolving {callee_name}: {e}")
                 continue
 
-            if not result:
+            else:
+                # ── normal call: resolve via clangd ──
+                try:
+                    result = self.client.textDocument_definition(
+                        caller_uri, line=line_idx, character=char_idx
+                    )
+                except Exception as e:
+                    self._log(f"Error resolving {callee_name}: {e}")
+                    continue
+
+                if not result:
+                    continue
+
+                target_uri = result.get("uri") or result.get("targetUri")
+                if not target_uri:
+                    continue
+
+                range_info = result.get("range") or result.get("targetRange", {})
+                callee_line_0 = range_info.get("start", {}).get("line", 0)
+                callee_path = self.client._uri_to_path(target_uri)
+                callee_uri = target_uri
+
+            # ══════════════════════════════════════════════════
+            # Step 2: Register + edge + recurse (normal calls)
+            # ══════════════════════════════════════════════════
+            if callee_path is None:
                 continue
 
-            # Parse target URI and line
-            target_uri = result.get("uri") or result.get("targetUri")
-            if not target_uri:
-                continue
-
-            range_info = result.get("range") or result.get("targetRange", {})
-            start_line_0 = range_info.get("start", {}).get("line", 0)
-
-            callee_path = self.client._uri_to_path(target_uri)
-
-            # Only recurse if in scope (defined by filter.cfg)
             if self._is_in_scope(callee_path):
-                # In-scope: resolve actual definition, then register + recurse
-
-                # Check if callee is within caller's function body
-                # This handles cases where Clangd returns declaration instead of definition
-                in_body = (start_0 <= start_line_0 <= end_0)
-                self._log(f"  Definition check: caller_lines={start_0}-{end_0}, callee_line={start_line_0}, in_body={in_body}")
+                # Check if definition is within caller body (clangd may return declaration)
+                in_body = (start_0 <= callee_line_0 <= end_0)
+                self._log(f"  Definition check: caller_lines={start_0}-{end_0}, callee_line={callee_line_0}, in_body={in_body}")
 
                 if not in_body:
-                    # Try to search for actual definition in the same file
-                    self._log(f"  Warning: Definition at line {start_line_0} is outside caller body")
-                    actual_def_line = self._search_for_definition_in_file(
-                        callee_path, callee_name
-                    )
+                    actual_def_line = self._search_for_definition_in_file(callee_path, callee_name)
                     if actual_def_line is None and '::' in callee_name:
-                        base_name = callee_name.split('::')[-1]
-                        self._log(f"  Retrying with base name: {base_name}")
-                        actual_def_line = self._search_for_definition_in_file(
-                            callee_path, base_name
-                        )
+                        self._log(f"  Retrying with base name: {callee_name.split('::')[-1]}")
+                        actual_def_line = self._search_for_definition_in_file(callee_path, callee_name.split('::')[-1])
                     if actual_def_line is None and callee_path.endswith(('.h', '.hpp')):
-                        cpp_candidates = []
                         base = callee_path.rsplit('.', 1)[0]
-                        for ext in ('.cpp', '.cc', '.cxx', '.c'):
-                            cpp_candidates.append(base + ext)
                         caller_dir = os.path.dirname(caller_path)
                         basename = os.path.basename(base)
-                        for ext in ('.cpp', '.cc', '.cxx', '.c'):
-                            cpp_candidates.append(os.path.join(caller_dir, basename + ext))
+                        cpp_candidates = [base + ext for ext in ('.cpp', '.cc', '.cxx', '.c')]
+                        cpp_candidates += [os.path.join(caller_dir, basename + ext) for ext in ('.cpp', '.cc', '.cxx', '.c')]
                         for cpp_path in cpp_candidates:
                             if os.path.isfile(cpp_path):
                                 self._log(f"  Trying .cpp counterpart: {cpp_path}")
-                                actual_def_line = self._search_for_definition_in_file(
-                                    cpp_path, callee_name
-                                )
+                                actual_def_line = self._search_for_definition_in_file(cpp_path, callee_name)
                                 if actual_def_line is None and '::' in callee_name:
-                                    actual_def_line = self._search_for_definition_in_file(
-                                        cpp_path, callee_name.split('::')[-1]
-                                    )
+                                    actual_def_line = self._search_for_definition_in_file(cpp_path, callee_name.split('::')[-1])
                                 if actual_def_line is not None:
                                     callee_path = cpp_path
-                                    target_uri = self.client._path_to_uri(cpp_path)
+                                    callee_uri = self.client._path_to_uri(cpp_path)
                                     break
                     if actual_def_line is not None:
-                        start_line_0 = actual_def_line
+                        callee_line_0 = actual_def_line
                         self._log(f"  Using actual definition at line {actual_def_line}")
                     else:
                         self._log(f"  Skipping: couldn't find definition for {callee_name}")
                         continue
 
-                # Register node and recurse
-                callee_id = self._register_node(callee_path, start_line_0 + 1, callee_name)
-                edge_key = (caller_id, callee_id)
-                if edge_key not in self.processed_outgoing:
-                    self.processed_outgoing.add(edge_key)
-                    self._add_edge(caller_id, callee_id)
+                callee_id = self._register_and_recurse(
+                    caller_id, callee_name, callee_path, callee_line_0, current_depth
+                )
+
+                # Resolve param_in callbacks (unified — works for any callee)
+                self._resolve_callback_edges(
+                    callee_id, callee_name, callee_path, callee_line_0,
+                    caller_path, current_depth
+                )
 
                 self._ensure_file_opened(callee_path)
-                self._build_outgoing(target_uri, callee_name, start_line_0, callee_id, current_depth + 1)
+                self._build_outgoing(callee_uri, callee_name, callee_line_0, callee_id, current_depth + 1)
             else:
-                # Out of scope (EXTERNAL): register as leaf, no recursion
-                callee_id = self._register_node(callee_path, start_line_0 + 1, callee_name)
-                edge_key = (caller_id, callee_id)
-                if edge_key not in self.processed_outgoing:
-                    self.processed_outgoing.add(edge_key)
-                    self._add_edge(caller_id, callee_id)
+                callee_id = self._register_and_recurse(
+                    caller_id, callee_name, callee_path, callee_line_0, current_depth
+                )
                 self._log(f"  External: {callee_name} @ {callee_path}")
 
     def _resolve_callback_parameter(
@@ -907,14 +932,14 @@ class CallGraphBuilder:
             return []
 
         try:
-            # Get callback parameter position for this API (from config)
+            # Get callback parameter positions for this API (from config)
             from .callback_config import is_callback_api
-            is_callback, param_idx = is_callback_api(api_name, self.callback_config)
+            is_callback, param_indices = is_callback_api(api_name, self.callback_config)
 
             if not is_callback:
                 return []
 
-            self._log(f"  Resolving callback parameter {param_idx} for API '{api_name}'")
+            self._log(f"  Resolving callback parameters {param_indices} for API '{api_name}'")
 
             # For multi-line calls, accumulate lines until closing parenthesis
             lines_accum = []
@@ -957,25 +982,29 @@ class CallGraphBuilder:
 
             params_str = params_str[:close_paren]
 
-            # Split by comma and extract the callback parameter
+            # Split by comma and extract the callback parameters
             params = [p.strip() for p in params_str.split(',')]
 
-            if param_idx >= len(params):
-                return []
+            results = []
+            for param_idx in param_indices:
+                if param_idx >= len(params):
+                    continue
 
-            callback_param = params[param_idx]
+                callback_param = params[param_idx]
 
-            # Extract callback name (function identifier)
-            callback_match = re.search(r'\b([a-zA-Z_]\w*)\b', callback_param)
-            if not callback_match:
-                return []
+                # Extract callback name (function identifier)
+                callback_match = re.search(r'\b([a-zA-Z_]\w*)\b', callback_param)
+                if not callback_match:
+                    continue
 
-            callback_name = callback_match.group(1)
+                callback_name = callback_match.group(1)
 
-            # Find character position in original line
-            callback_char = lines[start_line].find(callback_name)
+                # Find character position in original line
+                callback_char = lines[start_line].find(callback_name)
 
-            return [(callback_name, line_0, callback_char)]
+                results.append((callback_name, line_0, callback_char))
+
+            return results
 
         except Exception as e:
             self._log(f"Error resolving callback: {e}")

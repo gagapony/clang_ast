@@ -1,4 +1,4 @@
-"""Callback configuration loader (TOML-based with legacy .cfg support)."""
+"""Callback configuration loader (TOML-based)."""
 
 import os
 import re
@@ -24,14 +24,10 @@ class CallbackConfig:
     def _resolve_path(self) -> Optional[str]:
         if self._config_path is not None:
             return self._config_path
-        # Default: prefer callback.toml, fall back to callback.cfg
         base = os.path.join(os.path.dirname(__file__), "..")
         toml_path = os.path.join(base, "callback.toml")
-        cfg_path = os.path.join(base, "callback.cfg")
         if os.path.exists(toml_path):
             return toml_path
-        if os.path.exists(cfg_path):
-            return cfg_path
         return None
 
     def load(self) -> dict:
@@ -43,10 +39,7 @@ class CallbackConfig:
             self._data = {"param_in": {}, "func_map": {}, "ioctl_map": {"format": ""}}
             return self._data
 
-        if path.endswith('.cfg'):
-            self._data = self._load_legacy_cfg(path)
-        else:
-            self._data = self._load_toml(path)
+        self._data = self._load_toml(path)
         return self._data
 
     def _load_toml(self, path: str) -> dict:
@@ -72,7 +65,7 @@ class CallbackConfig:
         ioctl_commands = {k: v for k, v in ioctl_raw.items() if k not in ("format", "path")}
 
         return {
-            "param_in": {str(k): int(v) for k, v in param_in.items()},
+            "param_in": {str(k): list(v) if isinstance(v, list) else [int(v)] for k, v in param_in.items()},
             "func_map": func_map_nested,
             "ioctl_map": {"format": ioctl_format, "path": ioctl_path, "commands": ioctl_commands},
         }
@@ -138,38 +131,17 @@ class CallbackConfig:
 
         return result
 
-    def _load_legacy_cfg(self, path: str) -> dict:
-        """Load legacy .cfg format (api_name:param_index per line)."""
-        param_in: Dict[str, int] = {}
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    if ":" in line:
-                        parts = line.split(":", 1)
-                        api_name = parts[0].strip()
-                        try:
-                            param_in[api_name] = int(parts[1].strip())
-                        except ValueError:
-                            continue
-        except IOError as e:
-            print(f"Warning: Failed to load callback config: {e}", file=sys.stderr)
-        return {"param_in": param_in, "func_map": {}, "ioctl_map": {"format": ""}}
-
-
 
     # ── param_in API ──
-    def is_callback_api(self, function_name: str) -> Tuple[bool, int]:
+    def is_callback_api(self, function_name: str) -> Tuple[bool, List[int]]:
         param_in = self.load()["param_in"]
         base_name = function_name.split("::")[-1]
         if base_name in param_in:
             return True, param_in[base_name]
-        for api, idx in param_in.items():
+        for api, indices in param_in.items():
             if function_name.endswith("::" + api):
-                return True, idx
-        return False, -1
+                return True, indices
+        return False, []
 
     # ── func_map API ──
     def resolve_func_ptr(self, expression: str) -> List[str]:
@@ -189,27 +161,6 @@ class CallbackConfig:
         if expression in func_map:
             return func_map[expression].get("search_dir", "")
         return ""
-
-    def match_func_ptr_call(self, expression: str) -> Tuple[bool, List[str]]:
-        """
-        Match a function pointer call expression against func_map.
-        Returns (found, targets).
-        """
-        func_map = self.load()["func_map"]
-        if expression in func_map:
-            return True, func_map[expression].get("targets", [])
-        return False, []
-
-    def is_func_ptr_call(self, obj: str, field: str) -> Tuple[bool, List[str]]:
-        """
-        Check if obj->field or obj.field is a known function pointer call.
-        """
-        expr_arrow = f"{obj}->{field}"
-        expr_dot = f"{obj}.{field}"
-        found, targets = self.match_func_ptr_call(expr_arrow)
-        if found:
-            return True, targets
-        return self.match_func_ptr_call(expr_dot)
 
     def get_all_func_ptr_entries(self) -> dict:
         """
@@ -249,10 +200,10 @@ def _get_config(config_path: Optional[str] = None) -> CallbackConfig:
 
 
 # ── Backward-compatible module-level functions ──
-def is_callback_api(function_name: str, config_path: Optional[str] = None) -> Tuple[bool, int]:
+def is_callback_api(function_name: str, config_path: Optional[str] = None) -> Tuple[bool, List[int]]:
     return _get_config(config_path).is_callback_api(function_name)
 
-def get_callback_apis(config_path: Optional[str] = None) -> Dict[str, int]:
+def get_callback_apis(config_path: Optional[str] = None) -> Dict[str, List[int]]:
     return _get_config(config_path).load()["param_in"]
 
 def get_all_callback_apis(config_path: Optional[str] = None) -> List[str]:
